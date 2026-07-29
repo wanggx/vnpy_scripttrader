@@ -4,6 +4,7 @@ from vnpy.trader.ui import MainWindow, create_qapp
 
 from vnpy_ctp import CtpGateway
 from vnpy_scripttrader import ScriptTraderApp
+from vnpy_sqlapp import SqlApp
 
 
 def main() -> None:
@@ -15,6 +16,7 @@ def main() -> None:
 
     main_engine.add_gateway(CtpGateway)
     main_engine.add_app(ScriptTraderApp)
+    main_engine.add_app(SqlApp)
 
     main_window = MainWindow(main_engine, event_engine)
     main_window.showMaximized()
