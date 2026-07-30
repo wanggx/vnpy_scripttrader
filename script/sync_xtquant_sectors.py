@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from xtquant import xtdata
 from vnpy_sqlapp import APP_NAME
@@ -56,6 +56,9 @@ PROGRESS_INTERVAL: int = 100
 # 数据库每批插入行数；每批完成后输出一次日志，所有批次仍处于同一事务。
 INSERT_BATCH_SIZE: int = 10_000
 
+# 批量读取合约名称时的进度粒度。
+NAME_BATCH_SIZE: int = 500
+
 
 def _is_candidate_sector(sector: str) -> bool:
     """判断板块是否属于默认同步范围。"""
@@ -100,9 +103,39 @@ def _read_local_sector_codes(paths: list[Path]) -> set[str]:
     return codes
 
 
+def _get_stock_names(
+    engine: ScriptEngine,
+    stock_codes: list[str],
+) -> dict[str, str] | None:
+    """每个唯一标的只读取一次名称；用户停止时返回 ``None``。"""
+    names: dict[str, str] = {}
+    total: int = len(stock_codes)
+
+    for start in range(0, total, NAME_BATCH_SIZE):
+        if not engine.strategy_active:
+            engine.write_log(
+                f"同步已停止：已读取 {start}/{total} 个标的名称，数据库未修改"
+            )
+            return None
+
+        batch: list[str] = stock_codes[start : start + NAME_BATCH_SIZE]
+        details: dict[str, Any] = xtdata.get_instrument_detail_list(batch) or {}
+        for code in batch:
+            detail: dict[str, Any] | None = details.get(code)
+            names[code] = str((detail or {}).get("InstrumentName", "")).strip()
+
+        finished: int = min(start + len(batch), total)
+        engine.write_log(f"标的名称读取进度：{finished}/{total}")
+
+    missing: int = sum(not name for name in names.values())
+    if missing:
+        engine.write_log(f"有 {missing} 个标的未返回名称，将以空字符串保存")
+    return names
+
+
 def _collect_snapshot(
     engine: ScriptEngine,
-) -> tuple[list[str], list[tuple[str, str]]] | None:
+) -> tuple[list[str], list[tuple[str, str, str]]] | None:
     """从 xtquant 构建完整去重快照；用户停止时返回 ``None``。"""
     if REFRESH_SECTOR_DATA:
         engine.write_log("正在更新 xtquant 板块数据")
@@ -175,11 +208,48 @@ def _collect_snapshot(
     if not valid_sectors:
         raise RuntimeError("筛选后没有包含当前 A 股的有效板块，数据库未修改")
 
-    return valid_sectors, members
+    member_codes: list[str] = sorted({code for _, code in members})
+    engine.write_log(f"开始读取 {len(member_codes)} 个唯一标的名称")
+    stock_names: dict[str, str] | None = _get_stock_names(engine, member_codes)
+    if stock_names is None:
+        return None
+
+    named_members: list[tuple[str, str, str]] = [
+        (sector, code, stock_names.get(code, "")) for sector, code in members
+    ]
+    return valid_sectors, named_members
 
 
-def _ensure_tables(sql_engine: SqlEngine) -> None:
-    """创建跨 SQLite、MySQL、PostgreSQL 通用的快照表。"""
+def _column_exists(
+    sql_engine: SqlEngine,
+    driver: str,
+    table: str,
+    column: str,
+) -> bool:
+    """跨数据库检查表字段是否存在。"""
+    if driver == "sqlite":
+        rows: list[dict[str, Any]] = sql_engine.query_all(f"PRAGMA table_info({table})")
+        return any(row.get("name") == column for row in rows)
+
+    schema_filter: str = (
+        "table_schema = DATABASE()"
+        if driver == "mysql"
+        else "table_schema = current_schema()"
+    )
+    row: dict[str, Any] | None = sql_engine.query_one(
+        "SELECT 1 AS found FROM information_schema.columns "
+        f"WHERE {schema_filter} AND table_name = %s AND column_name = %s",
+        (table, column),
+    )
+    return row is not None
+
+
+def _ensure_tables(
+    sql_engine: SqlEngine,
+    driver: str,
+    engine: ScriptEngine,
+) -> None:
+    """创建快照表，并为旧关系表自动补充标的名称字段。"""
     sql_engine.execute(
         f"CREATE TABLE IF NOT EXISTS {SECTOR_TABLE} ("
         "sector_name VARCHAR(191) NOT NULL, "
@@ -190,17 +260,24 @@ def _ensure_tables(sql_engine: SqlEngine) -> None:
         f"CREATE TABLE IF NOT EXISTS {MEMBER_TABLE} ("
         "sector_name VARCHAR(191) NOT NULL, "
         "stock_code VARCHAR(64) NOT NULL, "
+        "stock_name VARCHAR(128) NOT NULL DEFAULT '', "
         "PRIMARY KEY (sector_name, stock_code), "
         f"FOREIGN KEY (sector_name) REFERENCES {SECTOR_TABLE}(sector_name)"
         ")"
     )
+    if not _column_exists(sql_engine, driver, MEMBER_TABLE, "stock_name"):
+        sql_engine.execute(
+            f"ALTER TABLE {MEMBER_TABLE} "
+            "ADD COLUMN stock_name VARCHAR(128) NOT NULL DEFAULT ''"
+        )
+        engine.write_log(f"旧表补列：{MEMBER_TABLE}.stock_name")
 
 
 def _replace_snapshot(
     sql_engine: SqlEngine,
     driver: str,
     sectors: list[str],
-    members: list[tuple[str, str]],
+    members: list[tuple[str, str, str]],
     engine: ScriptEngine,
 ) -> None:
     """在一个事务中精确替换快照，保证幂等性和失败回滚。"""
@@ -209,8 +286,8 @@ def _replace_snapshot(
         f"INSERT INTO {SECTOR_TABLE} (sector_name) VALUES ({placeholder})"
     )
     insert_member: str = (
-        f"INSERT INTO {MEMBER_TABLE} (sector_name, stock_code) "
-        f"VALUES ({placeholder}, {placeholder})"
+        f"INSERT INTO {MEMBER_TABLE} (sector_name, stock_code, stock_name) "
+        f"VALUES ({placeholder}, {placeholder}, {placeholder})"
     )
 
     with sql_engine.transaction() as conn:
@@ -247,7 +324,9 @@ def run(engine: ScriptEngine) -> None:
     driver: str = getattr(sql_engine.database, "driver_name", "sqlite")
     engine.write_log(f"SqlApp 已就绪，数据库驱动：{driver}")
 
-    snapshot: tuple[list[str], list[tuple[str, str]]] | None = _collect_snapshot(engine)
+    snapshot: tuple[list[str], list[tuple[str, str, str]]] | None = _collect_snapshot(
+        engine
+    )
     if snapshot is None:
         return
     sectors, members = snapshot
@@ -256,6 +335,6 @@ def run(engine: ScriptEngine) -> None:
         engine.write_log("同步已停止，数据库未修改")
         return
 
-    _ensure_tables(sql_engine)
+    _ensure_tables(sql_engine, driver, engine)
     _replace_snapshot(sql_engine, driver, sectors, members, engine)
     engine.write_log(f"板块同步完成：{len(sectors)} 个板块、{len(members)} 条成分关系")

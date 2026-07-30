@@ -9,7 +9,8 @@
 最高价已腰斩（``close <= 最高价 × HALF_RATIO``），未腰斩的标的在打分前整批剔除。
 
 需 MiniQMT 运行后经 ScriptTrader 执行（与 ``download_xtquant_daily.py`` 相同约束）。
-日线数据由 ``download_xtquant_daily.py`` 维护在 xtquant 本地缓存，本脚本只读不写缓存。
+全量历史由 ``download_xtquant_for_ma.py`` 一次性下载到 xtquant 本地缓存；本脚本每轮
+仅增量下载当日新日线，再用全区间读取计算均线（前复权下历史价会随分红整体位移）。
 
 默认每个交易日收盘后 16:00 执行一次并长期循环：启动后等待下一个 16:00 才首次
 执行，周末/节假日（非交易日）跳过，单轮失败等下一轮，用户停止则退出调度。
@@ -58,10 +59,6 @@ HALF_RATIO: float = 0.5
 HIGH_LOOKBACK: int = 252
 # 每批读取的标的数量，批间响应停止操作。
 BATCH_SIZE: int = 500
-# 增量下载：True 只补本地缓存缺失部分（按各标的最后时间戳向后增量，已缓存
-# 旧数据不重下）；False 全量重下指定区间。start_time 仍取最早均线起点，
-# 保证新上市标的首轮即可拿到完整历史。
-INCREMENTALLY: bool = True
 # 结果表名。
 TABLE_NAME: str = "stock_near_ma"
 # 打分权重模式：days=天数即权重 / equal=等权(仅看接近条数) / log=对数压缩。
@@ -204,27 +201,22 @@ def _filter_universe(
     return kept
 
 
-def _download_daily(
+def _download_today(
     engine: "ScriptEngine",
     universe: list[tuple[str, str]],
-    start_time: str,
-    end_time: str,
+    trade_date: str,
 ) -> bool:
-    """增量补全 universe 的日线到 MiniQMT 本地缓存。
+    """增量下载当日日线到 MiniQMT 本地缓存，只补当天不重下历史。
 
-    ``get_market_data_ex`` 只读本地缓存、不自动下载，故需先下载。用
-    ``download_history_data2`` 分批下载、``callback`` 实时输出进度。
-    ``incrementally=True`` 只补本地缓存缺失部分（按各标的最后时间戳向后
-    增量），已缓存旧数据不重下：首次运行仍需拉全量（较慢），日常只补最近
-    几根。``start_time`` 仍取最早均线起点，保证新上市标的首轮即拿到完整
-    历史。返回是否完整执行（用户停止返回 False）。
+    ``get_market_data_ex`` 只读缓存、不自动下载，故每轮需先补当日新 bar。
+    ``start_time=end_time=trade_date`` 只取当天，``incrementally=True`` 仅补
+    缓存缺失部分（已缓存不重下），全量历史由 ``download_xtquant_for_ma.py``
+    一次性拉、日常仅增量当天。单批失败记日志继续、不中断（读缓存兜底）。
+    返回是否完整执行（用户停止返回 False）。
     """
     codes: list[str] = [code for code, _ in universe]
     total: int = len(codes)
-    engine.write_log(
-        f"开始增量下载 {total} 个标的的日线（{start_time} 至 {end_time}），"
-        f"首次运行需拉全量较慢，日常只补缺失部分"
-    )
+    engine.write_log(f"开始增量下载当日日线（{trade_date}）：{total} 个标的")
     last_logged: list[int] = [0]
 
     def on_progress(data: dict[str, Any]) -> None:
@@ -232,11 +224,11 @@ def _download_daily(
         total_n: int = data.get("total", total)
         if done - last_logged[0] >= 500 or done >= total_n:
             last_logged[0] = done
-            engine.write_log(f"下载进度：{done}/{total_n}")
+            engine.write_log(f"当日下载进度：{done}/{total_n}")
 
     for start in range(0, total, BATCH_SIZE):
         if not engine.strategy_active:
-            engine.write_log(f"下载已停止：已补充约 {start}/{total} 个标的")
+            engine.write_log(f"当日下载已停止：已补充约 {start}/{total} 个标的")
             return False
 
         batch: list[str] = codes[start : start + BATCH_SIZE]
@@ -244,17 +236,17 @@ def _download_daily(
             xtdata.download_history_data2(
                 stock_list=batch,
                 period="1d",
-                start_time=start_time,
-                end_time=end_time,
+                start_time=trade_date,
+                end_time=trade_date,
                 callback=on_progress,
-                incrementally=INCREMENTALLY,
+                incrementally=True,
             )
             engine.write_log(
-                f"批次下载完成：已补充 {min(start + len(batch), total)}/{total} 个标的"
+                f"当日批次下载完成：已补充 {min(start + len(batch), total)}/{total} 个标的"
             )
-        except Exception as exc:  # noqa: BLE001 - 单批下载失败记日志继续，不中断
-            engine.write_log(f"批次下载异常（{batch[0]}~{batch[-1]}）：{exc}")
-    engine.write_log("日线下载完成")
+        except Exception as exc:  # noqa: BLE001 - 单批失败记日志继续，读缓存兜底
+            engine.write_log(f"当日批次下载异常（{batch[0]}~{batch[-1]}）：{exc}")
+    engine.write_log("当日日线下载完成")
     return True
 
 
@@ -266,11 +258,13 @@ def _load_bar_series(
 ) -> dict[str, pd.DataFrame] | None:
     """分批读取全池前复权收盘价/最高价，返回 ``{code: DataFrame}``。
 
-    用户停止时返回 None。``fill_data=False`` 让停牌留 NaN，``dropna`` 后的长度
-    才是真实交易日数。同时读 ``high`` 用于腰斩判断。
+    用户停止时返回 None。先增量下载当日日线（``_download_today``，只补当天），
+    再用 ``get_market_data_ex`` 读全区间缓存（前复权下每次新分红会整体位移
+    历史价，均线需重读全段，不可只取增量）。``fill_data=False`` 让停牌留 NaN，
+    ``dropna`` 后的长度才是真实交易日数。同时读 ``high`` 用于腰斩判断。
     """
-    # get_market_data_ex 只读本地缓存、不自动下载，先补全再读。
-    if not _download_daily(engine, universe, start_time, end_time):
+    # 当日新 bar 不在缓存里时 get_market_data_ex 取不到，先增量补当天。
+    if not _download_today(engine, universe, end_time):
         return None
 
     codes: list[str] = [code for code, _ in universe]
@@ -501,18 +495,20 @@ def _save_results(
         f"score INTEGER, "
         f"near_dates VARCHAR(64), "
         f"near_days VARCHAR(64), "
+        f"near_values VARCHAR(64), "
         f"PRIMARY KEY (trade_date, code)"
         f")"
     )
     sql_engine.execute(ddl)
-    # 已存在的旧表无 high52w 列时补列（CREATE TABLE IF NOT EXISTS 不改旧表结构）。
+    # 已存在的旧表缺列时补列（CREATE TABLE IF NOT EXISTS 不改旧表结构）。
     _ensure_column(sql_engine, driver, TABLE_NAME, "high52w", "REAL", engine)
+    _ensure_column(sql_engine, driver, TABLE_NAME, "near_values", "VARCHAR(64)", engine)
 
     delete_today: str = f"DELETE FROM {TABLE_NAME} WHERE trade_date = {ph}"
     insert: str = (
         f"INSERT INTO {TABLE_NAME} "
-        f"(trade_date, code, name, close, high52w, score, near_dates, near_days) "
-        f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})"
+        f"(trade_date, code, name, close, high52w, score, near_dates, near_days, near_values) "
+        f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})"
     )
     rows: list[tuple[Any, ...]] = [
         (
@@ -524,6 +520,7 @@ def _save_results(
             r["score"],
             ",".join(r["near_dates"]),
             ",".join(str(d) for d in r["near_days"]),
+            ",".join(str(v) for v in r["near_values"]),
         )
         for r in results
     ]
@@ -592,7 +589,10 @@ def run(engine: "ScriptEngine") -> None:
         engine.write_log("选股已停止（读取数据阶段）")
         return
     if not series_map:
-        raise RuntimeError("未读到任何行情数据，请检查 xtquant 本地缓存")
+        raise RuntimeError(
+            "未读到任何行情数据，请先运行 download_xtquant_for_ma.py "
+            "下载全量日线到 xtquant 本地缓存"
+        )
     engine.write_log(f"读到 {len(series_map)} 个标的的行情")
 
     # 确定本次计算交易日 T（自动适应盘中数据未就绪）。
