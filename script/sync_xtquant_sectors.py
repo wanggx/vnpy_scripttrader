@@ -1,13 +1,14 @@
 """同步 xtquant 板块及其成分到 SqlApp。
 
-表 ``xtquant_sector`` 保存筛选后的当前有效 A 股板块，表
-``xtquant_sector_member`` 保存板块和标的的多对多关系。脚本先在内存中完整构建
-快照，再用单个数据库事务替换旧数据；因此重复执行结果一致，抓取中断或异常也不
-会留下半份快照。
+表 ``xtquant_sector`` 以 ``sector_name1/2/3`` 保存申万三级分类路径，表
+``xtquant_sector_member`` 在同一路径上增加标的代码和名称。脚本先在内存中完整
+构建快照，再用单个数据库事务替换旧数据；因此重复执行结果一致，抓取中断或异常
+也不会留下半份快照。
 """
 
 from __future__ import annotations
 
+from itertools import product
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -25,30 +26,20 @@ MEMBER_TABLE: str = "xtquant_sector_member"
 # 每次运行前更新板块文件，确保新板块及最新成分可见。
 REFRESH_SECTOR_DATA: bool = True
 
-# 仅同步当前 A 股常用的板块体系，避免 get_sector_list() 返回的指数样本、ETF、
-# 港股、期货和客户端专题板块。需要迅投行业/概念/风格时可追加 TH/TG/TF/TD。
-INCLUDED_SECTOR_PREFIXES: tuple[str, ...] = (
-    "GN",  # 迅投概念
-    "SW",  # 申万行业（各级）
-    "CSRC",  # 证监会行业（各级）
-    "GICS",  # GICS 行业（各级）
-    "DY1",  # 一级地域（省、自治区、直辖市）
-)
+# 使用申万一级、二级、三级行业；同一标的可在三个层级分别建立关系。
+INCLUDED_SECTOR_PREFIXES: tuple[str, ...] = ("SW1", "SW2", "SW3")
 
 # xtquant 最新板块缓存中的分类目录。与上面的前缀共同约束同步范围。
-INCLUDED_SECTOR_CATEGORIES: tuple[str, ...] = (
-    "概念",
-    "申万行业",
-    "证监会行业",
-    "GICS",
-    "地域",
-)
+INCLUDED_SECTOR_CATEGORIES: tuple[str, ...] = ("申万行业",)
 
 # 申万板块同时提供普通和“加权”版本，成分关系基本重复，只保留普通版本。
 EXCLUDED_SECTOR_SUFFIXES: tuple[str, ...] = ("加权",)
 
 # 只保存当前仍属于沪深京 A 股池的成分，退市及其他市场标的不会落库。
 A_SHARE_SECTOR: str = "沪深京A股"
+
+# 尚未进入申万分类的新股使用统一占位值，确保当前 A 股仍能保存到关系表。
+UNCLASSIFIED_NAME: str = "未分类"
 
 # 控制进度日志频率，不影响抓取或写库批次。
 PROGRESS_INTERVAL: int = 100
@@ -65,6 +56,14 @@ def _is_candidate_sector(sector: str) -> bool:
     return sector.startswith(INCLUDED_SECTOR_PREFIXES) and not sector.endswith(
         EXCLUDED_SECTOR_SUFFIXES
     )
+
+
+def _get_sector_level(sector: str) -> int | None:
+    """从 SW1/SW2/SW3 板块名称解析申万行业层级。"""
+    for level in (1, 2, 3):
+        if sector.startswith(f"SW{level}"):
+            return level
+    return None
 
 
 def _get_local_sector_sources(
@@ -135,7 +134,7 @@ def _get_stock_names(
 
 def _collect_snapshot(
     engine: ScriptEngine,
-) -> tuple[list[str], list[tuple[str, str, str]]] | None:
+) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str, str, str]]] | None:
     """从 xtquant 构建完整去重快照；用户停止时返回 ``None``。"""
     if REFRESH_SECTOR_DATA:
         engine.write_log("正在更新 xtquant 板块数据")
@@ -178,8 +177,11 @@ def _collect_snapshot(
         f"原始板块 {len(all_sectors)} 个，按分类筛选为 {len(sectors)} 个；"
         f"当前 A 股池 {len(active_codes)} 个；来源：{source_name}"
     )
-    members: list[tuple[str, str]] = []
-    valid_sectors: list[str] = []
+    stock_sectors: dict[str, dict[int, set[str]]] = {
+        code: {1: set(), 2: set(), 3: set()} for code in active_codes
+    }
+    valid_sector_count: int = 0
+    raw_relation_count: int = 0
 
     for index, sector in enumerate(sectors, start=1):
         if not engine.strategy_active:
@@ -195,99 +197,96 @@ def _collect_snapshot(
         codes: set[str] = {
             str(code).strip() for code in raw_codes if str(code).strip() in active_codes
         }
-        if codes:
-            valid_sectors.append(sector)
-            members.extend((sector, code) for code in sorted(codes))
+        level: int | None = _get_sector_level(sector)
+        if codes and level is not None:
+            valid_sector_count += 1
+            raw_relation_count += len(codes)
+            for code in codes:
+                stock_sectors[code][level].add(sector)
 
         if index == 1 or index % PROGRESS_INTERVAL == 0 or index == len(sectors):
             engine.write_log(
                 f"板块读取进度：{index}/{len(sectors)}，"
-                f"有效板块 {len(valid_sectors)} 个、{len(members)} 条成分关系"
+                f"有效板块 {valid_sector_count} 个、{raw_relation_count} 条原始关系"
             )
 
-    if not valid_sectors:
+    if not valid_sector_count:
         raise RuntimeError("筛选后没有包含当前 A 股的有效板块，数据库未修改")
 
-    member_codes: list[str] = sorted({code for _, code in members})
-    engine.write_log(f"开始读取 {len(member_codes)} 个唯一标的名称")
-    stock_names: dict[str, str] | None = _get_stock_names(engine, member_codes)
+    relation_keys: list[tuple[str, str, str, str]] = []
+    for code in sorted(active_codes):
+        levels: dict[int, set[str]] = stock_sectors[code]
+        names1: list[str] = sorted(levels[1]) or [UNCLASSIFIED_NAME]
+        names2: list[str] = sorted(levels[2]) or [UNCLASSIFIED_NAME]
+        names3: list[str] = sorted(levels[3]) or [UNCLASSIFIED_NAME]
+        relation_keys.extend(
+            (name1, name2, name3, code)
+            for name1, name2, name3 in product(names1, names2, names3)
+        )
+
+    sector_paths: list[tuple[str, str, str]] = sorted(
+        {(name1, name2, name3) for name1, name2, name3, _ in relation_keys}
+    )
+    engine.write_log(
+        f"整理出 {len(sector_paths)} 条申万三级分类路径、"
+        f"{len(relation_keys)} 条标的关系"
+    )
+
+    stock_codes: list[str] = sorted(active_codes)
+    engine.write_log(f"开始读取 {len(stock_codes)} 个唯一标的名称")
+    stock_names: dict[str, str] | None = _get_stock_names(engine, stock_codes)
     if stock_names is None:
         return None
 
-    named_members: list[tuple[str, str, str]] = [
-        (sector, code, stock_names.get(code, "")) for sector, code in members
+    named_members: list[tuple[str, str, str, str, str]] = [
+        (name1, name2, name3, code, stock_names.get(code, ""))
+        for name1, name2, name3, code in relation_keys
     ]
-    return valid_sectors, named_members
+    return sector_paths, named_members
 
 
-def _column_exists(
-    sql_engine: SqlEngine,
-    driver: str,
-    table: str,
-    column: str,
-) -> bool:
-    """跨数据库检查表字段是否存在。"""
-    if driver == "sqlite":
-        rows: list[dict[str, Any]] = sql_engine.query_all(f"PRAGMA table_info({table})")
-        return any(row.get("name") == column for row in rows)
-
-    schema_filter: str = (
-        "table_schema = DATABASE()"
-        if driver == "mysql"
-        else "table_schema = current_schema()"
-    )
-    row: dict[str, Any] | None = sql_engine.query_one(
-        "SELECT 1 AS found FROM information_schema.columns "
-        f"WHERE {schema_filter} AND table_name = %s AND column_name = %s",
-        (table, column),
-    )
-    return row is not None
-
-
-def _ensure_tables(
-    sql_engine: SqlEngine,
-    driver: str,
-    engine: ScriptEngine,
-) -> None:
-    """创建快照表，并为旧关系表自动补充标的名称字段。"""
+def _ensure_tables(sql_engine: SqlEngine) -> None:
+    """不存在时创建两张申万三级分类快照表。"""
     sql_engine.execute(
         f"CREATE TABLE IF NOT EXISTS {SECTOR_TABLE} ("
-        "sector_name VARCHAR(191) NOT NULL, "
-        "PRIMARY KEY (sector_name)"
+        "sector_name1 VARCHAR(128) NOT NULL, "
+        "sector_name2 VARCHAR(128) NOT NULL, "
+        "sector_name3 VARCHAR(128) NOT NULL, "
+        "PRIMARY KEY (sector_name1, sector_name2, sector_name3)"
         ")"
     )
     sql_engine.execute(
         f"CREATE TABLE IF NOT EXISTS {MEMBER_TABLE} ("
-        "sector_name VARCHAR(191) NOT NULL, "
+        "sector_name1 VARCHAR(128) NOT NULL, "
+        "sector_name2 VARCHAR(128) NOT NULL, "
+        "sector_name3 VARCHAR(128) NOT NULL, "
         "stock_code VARCHAR(64) NOT NULL, "
         "stock_name VARCHAR(128) NOT NULL DEFAULT '', "
-        "PRIMARY KEY (sector_name, stock_code), "
-        f"FOREIGN KEY (sector_name) REFERENCES {SECTOR_TABLE}(sector_name)"
+        "PRIMARY KEY (sector_name1, sector_name2, sector_name3, stock_code), "
+        "FOREIGN KEY (sector_name1, sector_name2, sector_name3) "
+        f"REFERENCES {SECTOR_TABLE}(sector_name1, sector_name2, sector_name3)"
         ")"
     )
-    if not _column_exists(sql_engine, driver, MEMBER_TABLE, "stock_name"):
-        sql_engine.execute(
-            f"ALTER TABLE {MEMBER_TABLE} "
-            "ADD COLUMN stock_name VARCHAR(128) NOT NULL DEFAULT ''"
-        )
-        engine.write_log(f"旧表补列：{MEMBER_TABLE}.stock_name")
 
 
 def _replace_snapshot(
     sql_engine: SqlEngine,
     driver: str,
-    sectors: list[str],
-    members: list[tuple[str, str, str]],
+    sectors: list[tuple[str, str, str]],
+    members: list[tuple[str, str, str, str, str]],
     engine: ScriptEngine,
 ) -> None:
     """在一个事务中精确替换快照，保证幂等性和失败回滚。"""
     placeholder: str = "?" if driver == "sqlite" else "%s"
     insert_sector: str = (
-        f"INSERT INTO {SECTOR_TABLE} (sector_name) VALUES ({placeholder})"
+        f"INSERT INTO {SECTOR_TABLE} (sector_name1, sector_name2, sector_name3) "
+        f"VALUES ({placeholder}, {placeholder}, {placeholder})"
     )
     insert_member: str = (
-        f"INSERT INTO {MEMBER_TABLE} (sector_name, stock_code, stock_name) "
-        f"VALUES ({placeholder}, {placeholder}, {placeholder})"
+        f"INSERT INTO {MEMBER_TABLE} "
+        f"(sector_name1, sector_name2, sector_name3, stock_code, stock_name) "
+        f"VALUES ({placeholder}, {placeholder}, {placeholder}, "
+        f"{placeholder}, {placeholder})"
     )
 
     with sql_engine.transaction() as conn:
@@ -295,15 +294,17 @@ def _replace_snapshot(
         conn.execute(f"DELETE FROM {MEMBER_TABLE}")
         conn.execute(f"DELETE FROM {SECTOR_TABLE}")
 
-        write_groups: tuple[tuple[str, str, list[tuple[str, ...]]], ...] = (
-            ("板块", insert_sector, [(sector,) for sector in sectors]),
-            ("板块成分", insert_member, members),
+        sector_rows: list[tuple[Any, ...]] = [tuple(row) for row in sectors]
+        member_rows: list[tuple[Any, ...]] = [tuple(row) for row in members]
+        write_groups: tuple[tuple[str, str, list[tuple[Any, ...]]], ...] = (
+            ("板块", insert_sector, sector_rows),
+            ("板块成分", insert_member, member_rows),
         )
         for label, sql, rows in write_groups:
             total: int = len(rows)
             batch_count: int = (total + INSERT_BATCH_SIZE - 1) // INSERT_BATCH_SIZE
             for start in range(0, total, INSERT_BATCH_SIZE):
-                batch: list[tuple[str, ...]] = rows[start : start + INSERT_BATCH_SIZE]
+                batch: list[tuple[Any, ...]] = rows[start : start + INSERT_BATCH_SIZE]
                 conn.executemany(sql, batch)
                 finished: int = min(start + len(batch), total)
                 batch_number: int = start // INSERT_BATCH_SIZE + 1
@@ -324,9 +325,13 @@ def run(engine: ScriptEngine) -> None:
     driver: str = getattr(sql_engine.database, "driver_name", "sqlite")
     engine.write_log(f"SqlApp 已就绪，数据库驱动：{driver}")
 
-    snapshot: tuple[list[str], list[tuple[str, str, str]]] | None = _collect_snapshot(
-        engine
-    )
+    snapshot: (
+        tuple[
+            list[tuple[str, str, str]],
+            list[tuple[str, str, str, str, str]],
+        ]
+        | None
+    ) = _collect_snapshot(engine)
     if snapshot is None:
         return
     sectors, members = snapshot
@@ -335,6 +340,6 @@ def run(engine: ScriptEngine) -> None:
         engine.write_log("同步已停止，数据库未修改")
         return
 
-    _ensure_tables(sql_engine, driver, engine)
+    _ensure_tables(sql_engine)
     _replace_snapshot(sql_engine, driver, sectors, members, engine)
     engine.write_log(f"板块同步完成：{len(sectors)} 个板块、{len(members)} 条成分关系")
