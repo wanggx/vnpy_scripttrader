@@ -9,8 +9,9 @@
 最高价已腰斩（``close <= 最高价 × HALF_RATIO``），未腰斩的标的在打分前整批剔除。
 
 需 MiniQMT 运行后经 ScriptTrader 执行（与 ``download_xtquant_daily.py`` 相同约束）。
-全量历史由 ``download_xtquant_for_ma.py`` 一次性下载到 xtquant 本地缓存；本脚本每轮
-仅增量下载当日新日线，再用全区间读取计算均线（前复权下历史价会随分红整体位移）。
+所需历史由 ``download_xtquant_for_ma.py`` 预先下载到 xtquant 本地缓存；本脚本每轮
+仅为目标申万行业增量下载当日新日线，再用全区间读取计算均线（前复权下历史价会随分红
+整体位移）。
 
 默认每个交易日收盘后 16:00 执行一次并长期循环：启动后等待下一个 16:00 才首次
 执行，周末/节假日（非交易日）跳过，单轮失败等下一轮，用户停止则退出调度。
@@ -61,6 +62,8 @@ HIGH_LOOKBACK: int = 252
 BATCH_SIZE: int = 500
 # 结果表名。
 TABLE_NAME: str = "stock_near_ma"
+# xtquant 中的完整 sector 名称；多个板块用英文逗号分隔。
+TARGET_SECTOR_NAME: str = "SW2半导体,SW3半导体设备"
 # 打分权重模式：days=天数即权重 / equal=等权(仅看接近条数) / log=对数压缩。
 WEIGHT_MODE: str = "days"
 
@@ -70,9 +73,6 @@ RUN_MINUTE: int = 0
 # 等待时每步最长睡眠秒数，分段睡眠以快速响应停止操作。
 SLEEP_STEP_SECONDS: int = 60
 
-# xtquant 板块分类，新版用"沪深京A股"，旧版回退。
-PRIMARY_SECTOR: str = "沪深京A股"
-FALLBACK_SECTORS: tuple[str, ...] = ("沪深A股", "京市A股")
 VALID_MARKETS: tuple[str, ...] = (".SH", ".SZ", ".BJ")
 
 
@@ -90,7 +90,9 @@ def _next_run_dt(now: datetime) -> datetime:
 
     若 now 恰好是整点则算作"下一个"（启动不立即触发，符合"等到下一个16:00"）。
     """
-    candidate: datetime = now.replace(hour=RUN_HOUR, minute=RUN_MINUTE, second=0, microsecond=0)
+    candidate: datetime = now.replace(
+        hour=RUN_HOUR, minute=RUN_MINUTE, second=0, microsecond=0
+    )
     if candidate <= now:
         candidate += timedelta(days=1)
     return candidate
@@ -116,7 +118,7 @@ def _is_trading_day(date: datetime) -> bool:
     return date_str in _get_trading_dates(date_str, date_str)
 
 
-def _sleep_until(engine: "ScriptEngine", wake_at: datetime) -> bool:
+def _sleep_until(engine: ScriptEngine, wake_at: datetime) -> bool:
     """睡眠至 wake_at，分段以响应停止。返回是否正常醒来到点（False=被停止）。"""
     now: datetime = datetime.now()
     while now < wake_at:
@@ -149,29 +151,24 @@ def _normalize_bars(df: pd.DataFrame) -> pd.DataFrame:
     return bars.sort_index()
 
 
-def _get_all_stock_codes(engine: "ScriptEngine") -> list[str]:
-    """获取当前沪深京 A 股代码，兼容旧版板块分类。"""
-    engine.write_log("正在更新 xtquant 板块分类数据")
+def _get_sector_stock_codes(engine: ScriptEngine, sector_name: str) -> list[str]:
+    """从 xtquant 精确获取配置 sector 的当前成分。"""
     try:
-        xtdata.download_sector_data()
-    except Exception as exc:  # noqa: BLE001 - 板块刷新失败时仍尝试读取已有分类
-        engine.write_log(f"板块分类更新失败（忽略）：{exc}")
+        stock_codes: list[str] = xtdata.get_stock_list_in_sector(sector_name) or []
+    except Exception as exc:  # noqa: BLE001 - xtquant 异常只记录并结束本轮
+        engine.write_log(f"读取 xtquant 板块“{sector_name}”失败：{exc}")
+        return []
 
-    stock_codes: list[str] = xtdata.get_stock_list_in_sector(PRIMARY_SECTOR)
     if not stock_codes:
-        engine.write_log(
-            f"未找到“{PRIMARY_SECTOR}”板块，回退到：{', '.join(FALLBACK_SECTORS)}"
-        )
-        stock_codes = []
-        for sector in FALLBACK_SECTORS:
-            stock_codes.extend(xtdata.get_stock_list_in_sector(sector))
+        engine.write_log(f"xtquant 板块“{sector_name}”不存在或没有当前成分")
+        return []
 
-    # 多板块可能重复，过滤非沪深京市场的异常成分。
+    # 成分可能重复或混入其他市场，仅保留沪深京标的。
     return sorted({code for code in stock_codes if code.endswith(VALID_MARKETS)})
 
 
 def _filter_universe(
-    engine: "ScriptEngine",
+    engine: ScriptEngine,
     stock_codes: list[str],
 ) -> list[tuple[str, str]] | None:
     """筛选标的池：排除 ST/*ST 与合约信息缺失的标的。
@@ -179,9 +176,7 @@ def _filter_universe(
     返回 ``[(code, name)]``；用户停止时返回 None。
     上市太近、日线数据不足的标的在打分阶段按 ``MIN_BARS`` 过滤（那里才有收盘价数据）。
     """
-    engine.write_log(
-        f"正在读取 {len(stock_codes)} 个标的的合约信息（排除ST）"
-    )
+    engine.write_log(f"正在读取 {len(stock_codes)} 个标的的合约信息（排除ST）")
     kept: list[tuple[str, str]] = []
     total: int = len(stock_codes)
     for index, code in enumerate(stock_codes, start=1):
@@ -202,7 +197,7 @@ def _filter_universe(
 
 
 def _download_today(
-    engine: "ScriptEngine",
+    engine: ScriptEngine,
     universe: list[tuple[str, str]],
     trade_date: str,
 ) -> bool:
@@ -251,7 +246,7 @@ def _download_today(
 
 
 def _load_bar_series(
-    engine: "ScriptEngine",
+    engine: ScriptEngine,
     universe: list[tuple[str, str]],
     start_time: str,
     end_time: str,
@@ -308,7 +303,7 @@ def _load_bar_series(
 
 
 def _decide_trade_date(
-    engine: "ScriptEngine",
+    engine: ScriptEngine,
     series_map: dict[str, pd.DataFrame],
     calendar: list[str],
 ) -> str:
@@ -337,9 +332,7 @@ def _decide_trade_date(
             return candidate
 
     best: str = max(freq, key=lambda d: (freq[d], d))
-    engine.write_log(
-        f"未找到 >=50% 的交易日，使用众数 {best}（{freq[best]}/{total}）"
-    )
+    engine.write_log(f"未找到 >=50% 的交易日，使用众数 {best}（{freq[best]}/{total}）")
     return best
 
 
@@ -445,42 +438,13 @@ def _score_symbol(
     }
 
 
-def _ensure_column(
-    sql_engine: "SqlEngine",
-    driver: str,
-    table: str,
-    column: str,
-    col_type: str,
-    engine: "ScriptEngine",
-) -> None:
-    """确保表含指定列；旧表缺少该列时补列。
-
-    ``CREATE TABLE IF NOT EXISTS`` 不会修改已有表结构，新增列时需对已存在的旧表
-    执行 ``ALTER TABLE ADD COLUMN``，否则 INSERT 列数不匹配会报错。SQLite 用
-    PRAGMA、MySQL/PostgreSQL 用 information_schema 判断列是否存在。
-    """
-    if driver == "sqlite":
-        rows: list[dict[str, Any]] = sql_engine.query_all(f"PRAGMA table_info({table})")
-        exists: bool = any(r.get("name") == column for r in rows)
-    else:
-        hit: list[dict[str, Any]] = sql_engine.query_all(
-            f"SELECT 1 FROM information_schema.columns "
-            f"WHERE table_name = %s AND column_name = %s",
-            [table, column],
-        )
-        exists = bool(hit)
-    if exists:
-        return
-    sql_engine.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
-    engine.write_log(f"旧表补列：{table}.{column} {col_type}")
-
-
 def _save_results(
-    sql_engine: "SqlEngine",
+    sql_engine: SqlEngine,
     driver: str,
     trade_date: str,
+    sector_name: str,
     results: list[dict[str, Any]],
-    engine: "ScriptEngine",
+    engine: ScriptEngine,
 ) -> None:
     """建表、幂等写入当日结果、清理超过 RETENTION_DAYS 的旧数据。"""
     ph: str = "?" if driver == "sqlite" else "%s"
@@ -488,6 +452,7 @@ def _save_results(
     ddl: str = (
         f"CREATE TABLE IF NOT EXISTS {TABLE_NAME} ("
         f"trade_date VARCHAR(8) NOT NULL, "
+        f"sector_name VARCHAR(191) NOT NULL, "
         f"code VARCHAR(16) NOT NULL, "
         f"name VARCHAR(64), "
         f"close REAL, "
@@ -496,23 +461,24 @@ def _save_results(
         f"near_dates VARCHAR(64), "
         f"near_days VARCHAR(64), "
         f"near_values VARCHAR(64), "
-        f"PRIMARY KEY (trade_date, code)"
+        f"PRIMARY KEY (trade_date, sector_name, code)"
         f")"
     )
     sql_engine.execute(ddl)
-    # 已存在的旧表缺列时补列（CREATE TABLE IF NOT EXISTS 不改旧表结构）。
-    _ensure_column(sql_engine, driver, TABLE_NAME, "high52w", "REAL", engine)
-    _ensure_column(sql_engine, driver, TABLE_NAME, "near_values", "VARCHAR(64)", engine)
 
-    delete_today: str = f"DELETE FROM {TABLE_NAME} WHERE trade_date = {ph}"
+    delete_today: str = (
+        f"DELETE FROM {TABLE_NAME} WHERE trade_date = {ph} AND sector_name = {ph}"
+    )
     insert: str = (
         f"INSERT INTO {TABLE_NAME} "
-        f"(trade_date, code, name, close, high52w, score, near_dates, near_days, near_values) "
-        f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})"
+        f"(trade_date, sector_name, code, name, close, high52w, score, "
+        f"near_dates, near_days, near_values) "
+        f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})"
     )
     rows: list[tuple[Any, ...]] = [
         (
             trade_date,
+            r["sector_name"],
             r["code"],
             r["name"],
             r["close"],
@@ -526,35 +492,34 @@ def _save_results(
     ]
 
     with sql_engine.transaction() as conn:
-        conn.execute(delete_today, (trade_date,))
+        conn.execute(delete_today, (trade_date, sector_name))
         if rows:
             conn.executemany(insert, rows)
-    engine.write_log(f"已写入 {len(rows)} 行（trade_date={trade_date}）")
+    engine.write_log(
+        f"板块“{sector_name}”已写入 {len(rows)} 行（trade_date={trade_date}）"
+    )
 
     cutoff: str = (datetime.now() - timedelta(days=RETENTION_DAYS)).strftime("%Y%m%d")
     cleanup: str = f"DELETE FROM {TABLE_NAME} WHERE trade_date < {ph}"
     deleted: int = sql_engine.execute(cleanup, (cutoff,))
-    engine.write_log(f"清理 {RETENTION_DAYS} 天前数据：删除 {deleted} 行（cutoff={cutoff}）")
+    engine.write_log(
+        f"清理 {RETENTION_DAYS} 天前数据：删除 {deleted} 行（cutoff={cutoff}）"
+    )
 
 
-def run(engine: "ScriptEngine") -> None:
-    """执行一轮选股：取数 → 打分 → 选前 TOP_N → 落库 → 清理旧数据。"""
-    # A. 取 SqlEngine 并判定数据库驱动（三库兼容关键）。
-    sql_engine: "SqlEngine | None" = engine.main_engine.get_engine(APP_NAME)
-    if sql_engine is None:
-        raise RuntimeError(
-            "选股脚本依赖 SqlApp，请先加载 SqlApp（script/run.py 中 add_app(SqlApp)）"
-        )
-    driver: str = getattr(sql_engine.database, "driver_name", "sqlite")
-    engine.write_log(f"SqlApp 已就绪，数据库驱动：{driver}")
-
-    # B. 标的池：全市场 A 股，排除 ST（日线数据不足的在打分阶段按 MIN_BARS 剔除）。
-    stock_codes: list[str] = _get_all_stock_codes(engine)
+def _run_sector(
+    engine: ScriptEngine,
+    sql_engine: SqlEngine,
+    driver: str,
+    sector_name: str,
+) -> None:
+    """对单个板块执行原有选股流程。"""
+    # B. 标的池：xtquant 中的申万行业当前成分，排除 ST。
+    stock_codes: list[str] = _get_sector_stock_codes(engine, sector_name)
     if not stock_codes:
-        raise RuntimeError(
-            "xtquant 未返回任何 A 股代码，请确认 MiniQMT 已启动且行情服务可用"
-        )
-    engine.write_log(f"全市场代码 {len(stock_codes)} 个")
+        engine.write_log(f"板块“{sector_name}”没有可计算成分，跳过")
+        return
+    engine.write_log(f"目标板块“{sector_name}”：{len(stock_codes)} 个标的")
     universe: list[tuple[str, str]] | None = _filter_universe(engine, stock_codes)
     if universe is None:
         engine.write_log("选股已停止（筛选阶段）")
@@ -576,9 +541,7 @@ def run(engine: "ScriptEngine") -> None:
         for fixed_date in FIXED_DATES
     }
     start_min: str = min(window_start.values())
-    engine.write_log(
-        f"交易日历 {len(calendar)} 个，均线窗口起点：{window_start}"
-    )
+    engine.write_log(f"交易日历 {len(calendar)} 个，均线窗口起点：{window_start}")
 
     # D. 批量读取前复权收盘价/最高价（区间读到今天，便于 T 自动回退）。
     engine.write_log(f"开始读取前复权行情（{start_min} 至 {end_date}）")
@@ -625,6 +588,7 @@ def run(engine: "ScriptEngine") -> None:
             continue
         info["code"] = code
         info["name"] = name_map.get(code, "")
+        info["sector_name"] = sector_name
         scored.append(info)
     engine.write_log(
         f"打分完成：{len(scored)} 个标的接近至少一条均线，"
@@ -643,11 +607,47 @@ def run(engine: "ScriptEngine") -> None:
     )
 
     # H. 落库并清理旧数据。
-    _save_results(sql_engine, driver, trade_date, top, engine)
-    engine.write_log("选股完成")
+    _save_results(sql_engine, driver, trade_date, sector_name, top, engine)
+    engine.write_log(f"板块“{sector_name}”选股完成")
 
 
-def run1(engine: "ScriptEngine") -> None:
+def run(engine: ScriptEngine) -> None:
+    """按配置顺序逐个板块执行选股。"""
+    sql_engine: SqlEngine | None = engine.main_engine.get_engine(APP_NAME)
+    if sql_engine is None:
+        raise RuntimeError(
+            "选股脚本依赖 SqlApp，请先加载 SqlApp（script/run.py 中 add_app(SqlApp)）"
+        )
+    driver: str = getattr(sql_engine.database, "driver_name", "sqlite")
+    engine.write_log(f"SqlApp 已就绪，数据库驱动：{driver}")
+
+    sector_names: list[str] = [
+        name.strip() for name in TARGET_SECTOR_NAME.split(",") if name.strip()
+    ]
+    if not sector_names:
+        engine.write_log("TARGET_SECTOR_NAME 为空，本轮结束")
+        return
+
+    try:
+        engine.write_log("正在更新 xtquant 板块分类数据")
+        xtdata.download_sector_data()
+    except Exception as exc:  # noqa: BLE001 - xtquant 异常只记录并结束本轮
+        engine.write_log(f"更新 xtquant 板块分类数据失败：{exc}")
+        return
+
+    total: int = len(sector_names)
+    for index, sector_name in enumerate(sector_names, start=1):
+        if not engine.strategy_active:
+            engine.write_log("选股已停止")
+            return
+        engine.write_log(f"开始处理板块 {index}/{total}：{sector_name}")
+        try:
+            _run_sector(engine, sql_engine, driver, sector_name)
+        except Exception as exc:  # noqa: BLE001 - 单板块失败继续处理其他板块
+            engine.write_log(f"板块“{sector_name}”处理异常：{exc}")
+
+
+def run1(engine: ScriptEngine) -> None:
     """ScriptTrader 策略入口：每个交易日 16:00 循环执行选股。
 
     - 启动后等待下一个 16:00 才首次执行（不立即触发）；
@@ -676,4 +676,3 @@ def run1(engine: "ScriptEngine") -> None:
             engine.write_log(f"本轮执行异常：\n{traceback.format_exc()}")
         # 循环回到顶部，计算下一个 16:00（自然顺延到次日）。
     engine.write_log("选股调度已停止")
-
