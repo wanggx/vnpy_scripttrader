@@ -611,8 +611,8 @@ def _run_sector(
     engine.write_log(f"板块“{sector_name}”选股完成")
 
 
-def run(engine: ScriptEngine) -> None:
-    """按配置顺序逐个板块执行选股。"""
+def _run_once(engine: ScriptEngine) -> None:
+    """按配置顺序逐个板块执行一次选股。"""
     sql_engine: SqlEngine | None = engine.main_engine.get_engine(APP_NAME)
     if sql_engine is None:
         raise RuntimeError(
@@ -647,7 +647,7 @@ def run(engine: ScriptEngine) -> None:
             engine.write_log(f"板块“{sector_name}”处理异常：{exc}")
 
 
-def run1(engine: ScriptEngine) -> None:
+def run(engine: ScriptEngine) -> None:
     """ScriptTrader 策略入口：每个交易日 16:00 循环执行选股。
 
     - 启动后等待下一个 16:00 才首次执行（不立即触发）；
@@ -671,7 +671,7 @@ def run1(engine: ScriptEngine) -> None:
             continue
 
         try:
-            run(engine)
+            _run_once(engine)
         except Exception:  # noqa: BLE001 - 单轮失败不中断调度
             engine.write_log(f"本轮执行异常：\n{traceback.format_exc()}")
         # 循环回到顶部，计算下一个 16:00（自然顺延到次日）。
