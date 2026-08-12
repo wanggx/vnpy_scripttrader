@@ -25,12 +25,15 @@ from pathlib import Path
 
 from vnpy.trader.app import BaseApp
 
-from .engine import ScriptEngine, APP_NAME
+from .base import APP_NAME, EVENT_SCRIPT_LOG, EVENT_SCRIPT_STRATEGY
+from .engine import ScriptEngine
 from .cli import init_cli_trading
 
 
 __all__ = [
     "APP_NAME",
+    "EVENT_SCRIPT_LOG",
+    "EVENT_SCRIPT_STRATEGY",
     "ScriptEngine",
     "ScriptTraderApp",
     "init_cli_trading",

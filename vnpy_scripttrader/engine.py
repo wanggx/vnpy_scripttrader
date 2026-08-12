@@ -1,6 +1,8 @@
 import sys
+import inspect
 import importlib
 import traceback
+import threading
 from types import ModuleType
 from typing import Any
 from collections.abc import Callable
@@ -30,11 +32,9 @@ from vnpy.trader.object import (
     CancelRequest
 )
 from vnpy.trader.datafeed import BaseDatafeed, get_datafeed
+from vnpy.trader.utility import load_json, save_json
 
-
-APP_NAME = "ScriptTrader"
-
-EVENT_SCRIPT_LOG = "eScriptLog"
+from .base import APP_NAME, EVENT_SCRIPT_LOG, EVENT_SCRIPT_STRATEGY, ScriptData
 
 
 class ScriptEngine(BaseEngine):
@@ -45,59 +45,252 @@ class ScriptEngine(BaseEngine):
         """"""
         super().__init__(main_engine, event_engine, APP_NAME)
 
-        self.strategy_active: bool = False
-        self.strategy_thread: Thread | None = None
+        # 多脚本记录状态（替代原 strategy_active / strategy_thread 单脚本字段）
+        self.scripts: dict[str, ScriptData] = {}            # script_name -> ScriptData
+        self.script_threads: dict[str, Thread] = {}         # script_name -> Thread
+        self.script_active_flags: dict[str, bool] = {}      # script_name -> 活跃标志
+        self.script_setting: dict = {}                      # script_name -> {script_path, parameters}
+
+        # 当前线程所运行脚本的 name，供 is_active()/strategy_active 按线程解析
+        self._current_script: threading.local = threading.local()
 
         self.datafeed: BaseDatafeed = get_datafeed()
 
         log_engine: LogEngine = self.main_engine.get_engine("log")
         log_engine.register_log(EVENT_SCRIPT_LOG)
 
-    def init(self) -> None:
-        """启动策略引擎"""
+    def init_engine(self) -> None:
+        """启动脚本策略引擎：初始化数据服务并加载持久化记录（不自动启动）。"""
         result: bool = self.datafeed.init()
         if result:
             self.write_log("数据服务初始化成功")
 
-    def start_strategy(self, script_path: str) -> None:
-        """运行策略线程中的策略方法"""
-        if self.strategy_active:
+        self.load_script_setting()
+        self.write_log("脚本策略引擎初始化成功")
+
+    # 向后兼容：cli 及旧代码调用的 init()
+    init = init_engine
+
+    def add_script(self, script_name: str, script_path: str, parameters: dict) -> None:
+        """添加一条脚本记录。"""
+        if script_name in self.scripts:
+            self.write_log(f"创建脚本失败，存在重名 {script_name}")
             return
-        self.strategy_active = True
 
-        self.strategy_thread = Thread(
-            target=self.run_strategy, args=(script_path,))
-        self.strategy_thread.start()
+        script_data: ScriptData = ScriptData(
+            script_name=script_name,
+            script_path=script_path,
+            parameters=parameters,
+            inited=True,
+            trading=False,
+            class_name=Path(script_path).stem,
+        )
+        self.scripts[script_name] = script_data
+        self.script_active_flags[script_name] = False
 
-        self.write_log("策略交易脚本启动")
+        self.update_script_setting(script_name, script_path, parameters)
+        self.put_script_event(script_data)
 
-    def run_strategy(self, script_path: str) -> None:
-        """加载策略脚本并调用run函数"""
+    def remove_script(self, script_name: str) -> bool:
+        """移除一条脚本记录，运行中则拒绝。"""
+        script_data: ScriptData | None = self.scripts.get(script_name)
+        if not script_data:
+            return False
+
+        if script_data.trading:
+            self.write_log(f"脚本 {script_name} 移除失败，请先停止")
+            return False
+
+        self.remove_script_setting(script_name)
+        self.scripts.pop(script_name)
+        self.script_active_flags.pop(script_name, None)
+        self.script_threads.pop(script_name, None)
+
+        self.write_log(f"脚本 {script_name} 移除成功")
+        return True
+
+    def edit_script(self, script_name: str, parameters: dict) -> None:
+        """编辑脚本参数，运行中则拒绝。"""
+        script_data: ScriptData = self.scripts[script_name]
+        if script_data.trading:
+            self.write_log(f"脚本 {script_name} 编辑失败，请先停止")
+            return
+
+        script_data.parameters = parameters
+        self.update_script_setting(script_name, script_data.script_path, parameters)
+        self.put_script_event(script_data)
+
+    def start_script(self, script_name: str) -> None:
+        """在独立线程中启动一条脚本记录。"""
+        script_data: ScriptData = self.scripts[script_name]
+        if script_data.trading:
+            self.write_log(f"{script_name} 已经启动，请勿重复操作")
+            return
+
+        self.script_active_flags[script_name] = True
+        script_data.trading = True
+        self.put_script_event(script_data)
+
+        thread: Thread = Thread(target=self.run_script, args=(script_name,))
+        self.script_threads[script_name] = thread
+        thread.start()
+
+        self.write_log(f"脚本 {script_name} 启动", script_name)
+
+    def run_script(self, script_name: str) -> None:
+        """加载脚本模块并调用 module.run(self, **parameters)。"""
+        script_data: ScriptData = self.scripts[script_name]
+        script_path: str = script_data.script_path
+        parameters: dict = script_data.parameters
+
         path: Path = Path(script_path)
-        sys.path.append(str(path.parent))
+        if str(path.parent) not in sys.path:
+            sys.path.append(str(path.parent))
 
-        script_name: str = path.parts[-1]
-        module_name: str = script_name.replace(".py", "")
+        module_name: str = path.stem
+
+        # 登记当前线程对应的脚本名，供 is_active()/strategy_active 解析
+        self._current_script.name = script_name
 
         try:
             module: ModuleType = importlib.import_module(module_name)
             importlib.reload(module)
-            module.run(self)
+
+            # 反射 run() 签名组装 kwargs：排除 engine，优先用记录里的值，其次默认值
+            sig: inspect.Signature = inspect.signature(module.run)
+            kwargs: dict = {}
+            for name, param in sig.parameters.items():
+                if name == "engine":
+                    continue
+                if name in parameters:
+                    kwargs[name] = parameters[name]
+                elif param.default is not inspect.Parameter.empty:
+                    kwargs[name] = param.default
+                else:
+                    self.write_log(f"参数 {name} 未提供且无默认值，跳过", script_name)
+
+            module.run(self, **kwargs)
         except Exception:
             msg: str = f"触发异常已停止\n{traceback.format_exc()}"
-            self.write_log(msg)
+            self.write_log(msg, script_name)
+        finally:
+            self.script_active_flags[script_name] = False
+            script_data.trading = False
+            self.script_threads.pop(script_name, None)
+            self._current_script.name = None
+            self.put_script_event(script_data)
 
-    def stop_strategy(self) -> None:
-        """停止运行中的策略"""
-        if not self.strategy_active:
+    def stop_script(self, script_name: str) -> None:
+        """置活跃标志为 False 通知脚本退出，并 join 线程。"""
+        script_data: ScriptData | None = self.scripts.get(script_name)
+        if not script_data or not script_data.trading:
             return
-        self.strategy_active = False
 
-        if self.strategy_thread:
-            self.strategy_thread.join()
-        self.strategy_thread = None
+        self.script_active_flags[script_name] = False
 
-        self.write_log("策略交易脚本停止")
+        thread: Thread | None = self.script_threads.get(script_name)
+        if thread:
+            thread.join(timeout=5)
+        self.script_threads.pop(script_name, None)
+
+        script_data.trading = False
+        self.put_script_event(script_data)
+        self.write_log(f"脚本 {script_name} 停止", script_name)
+
+    def start_all_scripts(self) -> None:
+        """启动全部脚本记录。"""
+        for script_name in list(self.scripts.keys()):
+            self.start_script(script_name)
+
+    def stop_all_scripts(self) -> None:
+        """停止全部脚本记录。"""
+        for script_name in list(self.scripts.keys()):
+            self.stop_script(script_name)
+
+    def close(self) -> None:
+        """"""
+        self.stop_all_scripts()
+
+    # ---- 停止 API（脚本侧） ----
+
+    def is_active(self) -> bool:
+        """当前线程所运行脚本是否仍活跃。
+
+        脚本在长循环里调用 ``while engine.is_active():`` 即可响应停止。
+        """
+        name: str | None = getattr(self._current_script, "name", None)
+        if not name:
+            return False
+        return self.script_active_flags.get(name, False)
+
+    @property
+    def strategy_active(self) -> bool:
+        """向后兼容：旧脚本 ``engine.strategy_active`` 读法等价于 is_active()。"""
+        return self.is_active()
+
+    def is_script_active(self, script_name: str) -> bool:
+        """显式按名查询某条记录的活跃状态（UI/外部用）。"""
+        return self.script_active_flags.get(script_name, False)
+
+    # ---- 持久化 ----
+
+    def load_script_setting(self) -> None:
+        """加载配置文件并逐条注册记录（不自动启动）。"""
+        self.script_setting = load_json(self.setting_filename)
+
+        for script_name, config in self.script_setting.items():
+            self.add_script(
+                script_name,
+                config["script_path"],
+                config["parameters"]
+            )
+
+    def update_script_setting(
+        self, script_name: str, script_path: str, parameters: dict
+    ) -> None:
+        """更新/追加一条记录到配置文件。"""
+        self.script_setting[script_name] = {
+            "script_path": script_path,
+            "parameters": parameters,
+        }
+        save_json(self.setting_filename, self.script_setting)
+
+    def remove_script_setting(self, script_name: str) -> None:
+        """从配置文件移除一条记录。"""
+        if script_name not in self.script_setting:
+            return
+        self.script_setting.pop(script_name)
+        save_json(self.setting_filename, self.script_setting)
+
+    # ---- 事件与反射 ----
+
+    def put_script_event(self, script_data: ScriptData) -> None:
+        """广播事件以更新 UI 卡片状态。"""
+        data: dict = script_data.get_data()
+        event: Event = Event(EVENT_SCRIPT_STRATEGY, data)
+        self.event_engine.put(event)
+
+    def get_script_parameters(self, script_path: str) -> dict:
+        """导入脚本模块并反射 run()，返回排除 engine 后的参数默认值字典。"""
+        path: Path = Path(script_path)
+        if str(path.parent) not in sys.path:
+            sys.path.append(str(path.parent))
+
+        module_name: str = path.stem
+        module: ModuleType = importlib.import_module(module_name)
+        importlib.reload(module)
+
+        parameters: dict = {}
+        sig: inspect.Signature = inspect.signature(module.run)
+        for name, param in sig.parameters.items():
+            if name == "engine":
+                continue
+            if param.default is not inspect.Parameter.empty:
+                parameters[name] = param.default
+            else:
+                parameters[name] = ""
+
+        return parameters
 
     def connect_gateway(self, setting: dict, gateway_name: str) -> None:
         """"""
@@ -300,8 +493,11 @@ class ScriptEngine(BaseEngine):
         bars: Sequence[BarData] | DataFrame = get_data(self.datafeed.query_bar_history, arg=req, use_df=use_df)
         return bars
 
-    def write_log(self, msg: str) -> None:
+    def write_log(self, msg: str, script_name: str | None = None) -> None:
         """"""
+        if script_name:
+            msg = f"[{script_name}]  {msg}"
+
         log: LogData = LogData(msg=msg, gateway_name=APP_NAME)
         print(f"{log.time}\t{log.msg}")
 

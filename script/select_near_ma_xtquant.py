@@ -63,7 +63,7 @@ BATCH_SIZE: int = 500
 # 结果表名。
 TABLE_NAME: str = "stock_near_ma"
 # xtquant 中的完整 sector 名称；多个板块用英文逗号分隔。
-TARGET_SECTOR_NAME: str = "SW2半导体,SW3半导体设备"
+TARGET_SECTOR_NAME: str = "SW2半导体,SW3半导体设备,SW2贵金属,SW2小金属"
 # 打分权重模式：days=天数即权重 / equal=等权(仅看接近条数) / log=对数压缩。
 WEIGHT_MODE: str = "days"
 
@@ -122,13 +122,13 @@ def _sleep_until(engine: ScriptEngine, wake_at: datetime) -> bool:
     """睡眠至 wake_at，分段以响应停止。返回是否正常醒来到点（False=被停止）。"""
     now: datetime = datetime.now()
     while now < wake_at:
-        if not engine.strategy_active:
+        if not engine.is_active():
             return False
         remaining: float = (wake_at - now).total_seconds()
         step: float = min(SLEEP_STEP_SECONDS, remaining)
         time.sleep(step)
         now = datetime.now()
-    return engine.strategy_active
+    return engine.is_active()
 
 
 def _normalize_bars(df: pd.DataFrame) -> pd.DataFrame:
@@ -180,7 +180,7 @@ def _filter_universe(
     kept: list[tuple[str, str]] = []
     total: int = len(stock_codes)
     for index, code in enumerate(stock_codes, start=1):
-        if not engine.strategy_active:
+        if not engine.is_active():
             engine.write_log(f"筛选已停止：已处理 {index - 1}/{total}")
             return None
         if index % 500 == 0:
@@ -222,7 +222,7 @@ def _download_today(
             engine.write_log(f"当日下载进度：{done}/{total_n}")
 
     for start in range(0, total, BATCH_SIZE):
-        if not engine.strategy_active:
+        if not engine.is_active():
             engine.write_log(f"当日下载已停止：已补充约 {start}/{total} 个标的")
             return False
 
@@ -268,7 +268,7 @@ def _load_bar_series(
     logged_sample: bool = False
 
     for start in range(0, total, BATCH_SIZE):
-        if not engine.strategy_active:
+        if not engine.is_active():
             engine.write_log(f"读取已停止：已补充约 {start}/{total} 个标的")
             return None
 
@@ -569,7 +569,7 @@ def _run_sector(
     skipped_not_halved: int = 0
     total: int = len(series_map)
     for index, (code, bars) in enumerate(series_map.items(), start=1):
-        if index % 1000 == 0 and not engine.strategy_active:
+        if index % 1000 == 0 and not engine.is_active():
             engine.write_log(f"选股已停止（打分阶段，已处理 {index}/{total}）")
             return
         # 数据不足的新股不考虑（上市太近、长期停牌致有效日线不足 MIN_BARS）。
@@ -611,8 +611,15 @@ def _run_sector(
     engine.write_log(f"板块“{sector_name}”选股完成")
 
 
-def _run_once(engine: ScriptEngine) -> None:
-    """按配置顺序逐个板块执行一次选股。"""
+def _run_once(
+    engine: ScriptEngine,
+    target_sector_name: str = TARGET_SECTOR_NAME,
+) -> None:
+    """按配置顺序逐个板块执行一次选股。
+
+    参数：
+      target_sector_name  逗号分隔的板块名称串，未传时取模块常量 TARGET_SECTOR_NAME
+    """
     sql_engine: SqlEngine | None = engine.main_engine.get_engine(APP_NAME)
     if sql_engine is None:
         raise RuntimeError(
@@ -622,10 +629,10 @@ def _run_once(engine: ScriptEngine) -> None:
     engine.write_log(f"SqlApp 已就绪，数据库驱动：{driver}")
 
     sector_names: list[str] = [
-        name.strip() for name in TARGET_SECTOR_NAME.split(",") if name.strip()
+        name.strip() for name in target_sector_name.split(",") if name.strip()
     ]
     if not sector_names:
-        engine.write_log("TARGET_SECTOR_NAME 为空，本轮结束")
+        engine.write_log("target_sector_name 为空，本轮结束")
         return
 
     try:
@@ -637,7 +644,7 @@ def _run_once(engine: ScriptEngine) -> None:
 
     total: int = len(sector_names)
     for index, sector_name in enumerate(sector_names, start=1):
-        if not engine.strategy_active:
+        if not engine.is_active():
             engine.write_log("选股已停止")
             return
         engine.write_log(f"开始处理板块 {index}/{total}：{sector_name}")
@@ -647,19 +654,25 @@ def _run_once(engine: ScriptEngine) -> None:
             engine.write_log(f"板块“{sector_name}”处理异常：{exc}")
 
 
-def run(engine: ScriptEngine) -> None:
+def run(
+    engine: ScriptEngine,
+    target_sector_name: str = TARGET_SECTOR_NAME,
+) -> None:
     """ScriptTrader 策略入口：每个交易日 16:00 循环执行选股。
 
     - 启动后等待下一个 16:00 才首次执行（不立即触发）；
     - 周末/节假日（非交易日）跳过，等到下一个交易日 16:00；
     - 单轮异常被捕获并记日志，不影响后续轮次；
-    - 用户停止（``engine.strategy_active`` 为 False）则退出调度。
+    - 用户停止（``engine.is_active()`` 为 False）则退出调度。
+
+    参数：
+      target_sector_name  逗号分隔的板块名称串，未传时取模块常量 TARGET_SECTOR_NAME
     """
     engine.write_log(
         f"选股调度启动：每交易日 {RUN_HOUR:02d}:{RUN_MINUTE:02d} 执行，"
         f"非交易日跳过，等待首个触发点..."
     )
-    while engine.strategy_active:
+    while engine.is_active():
         wake_at: datetime = _next_run_dt(datetime.now())
         engine.write_log(f"下次执行时间：{wake_at.strftime('%Y-%m-%d %H:%M:%S')}")
         if not _sleep_until(engine, wake_at):
@@ -671,7 +684,7 @@ def run(engine: ScriptEngine) -> None:
             continue
 
         try:
-            _run_once(engine)
+            _run_once(engine, target_sector_name)
         except Exception:  # noqa: BLE001 - 单轮失败不中断调度
             engine.write_log(f"本轮执行异常：\n{traceback.format_exc()}")
         # 循环回到顶部，计算下一个 16:00（自然顺延到次日）。
