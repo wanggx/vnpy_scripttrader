@@ -2,9 +2,16 @@
 
 建议在交易日收盘后通过 ScriptTrader 运行本脚本。下载结果由 xtquant
 写入 MiniQMT 本地行情缓存，不会保存到 VeighNa 数据库。
+
+策略（避免按天扫描、避免分批 ``download_history_data2`` 把 MiniQMT 打挂）：
+
+1. 按标的读本地最后一根日线，已覆盖最新交易日的跳过；
+2. 其余代码一次传入，``start_time=start_date``、``end_time=今天``、
+   ``incrementally=True`` 只补缺口；
+3. 全区间一次调用失败时，再按自然年切几刀重试（每年仍是一次全名单，
+   不按 500 一批循环）。
 """
 
-from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -23,11 +30,19 @@ FALLBACK_SECTORS: tuple[str, ...] = ("沪深A股", "京市A股")
 # 选股均线窗口；改 FIXED_DATES 时记得同步本值。
 START_DATE: str = "20220427"
 
-# 每批下载数量。分批后可在两批之间响应 ScriptTrader 的停止操作。
-BATCH_SIZE: int = 500
+# 读取本地最后一根时的分批大小（只读缓存，不会打挂下载通道）。
+READ_BATCH_SIZE: int = 500
+
+# 与选股脚本一致：缓存存的是未复权 K 线，读取时按前复权检查是否已覆盖。
+DIVIDEND_TYPE: str = "front"
+
+# 下载进度日志间隔（callback.finished，按标的计数）。
+DOWNLOAD_LOG_EVERY: int = 200
 
 # 板块数据更新频率较低，但更新后才能包含最新上市的股票。
 REFRESH_SECTOR_DATA: bool = True
+
+VALID_MARKETS: tuple[str, ...] = (".SH", ".SZ", ".BJ")
 
 
 def get_all_stock_codes(engine: "ScriptEngine") -> list[str]:
@@ -36,44 +51,24 @@ def get_all_stock_codes(engine: "ScriptEngine") -> list[str]:
         engine.write_log("正在更新 xtquant 板块分类数据")
         xtdata.download_sector_data()
 
-    stock_codes: list[str] = xtdata.get_stock_list_in_sector(PRIMARY_SECTOR)
+    stock_codes: list[str] = xtdata.get_stock_list_in_sector(PRIMARY_SECTOR) or []
     if not stock_codes:
         engine.write_log(
             f"未找到“{PRIMARY_SECTOR}”板块，回退到：{', '.join(FALLBACK_SECTORS)}"
         )
         stock_codes = []
         for sector in FALLBACK_SECTORS:
-            stock_codes.extend(xtdata.get_stock_list_in_sector(sector))
+            stock_codes.extend(xtdata.get_stock_list_in_sector(sector) or [])
 
-    # 多个板块可能有重复代码，同时过滤非沪深京市场的异常成分。
-    valid_markets: tuple[str, ...] = (".SH", ".SZ", ".BJ")
-    return sorted({code for code in stock_codes if code.endswith(valid_markets)})
-
-
-def create_progress_callback(
-    engine: "ScriptEngine",
-    batch_base: int,
-    batch_size: int,
-    total: int,
-) -> Callable[[dict[str, Any]], None]:
-    """创建绑定当前批次信息的进度回调。"""
-
-    def on_progress(data: dict[str, Any]) -> None:
-        finished: int = int(data.get("finished", 0))
-        current: int = min(batch_base + finished, total)
-        message: str = str(data.get("message", "")).strip()
-
-        if finished == 1 or finished == batch_size or current % 100 == 0:
-            log_text: str = f"下载进度：{current}/{total}"
-            if message:
-                log_text += f"，{message}"
-            engine.write_log(log_text)
-
-    return on_progress
+    return sorted({code for code in stock_codes if code.endswith(VALID_MARKETS)})
 
 
 def get_trading_dates(end_date: str, start_date: str = START_DATE) -> list[str]:
-    """获取起始日期至结束日期之间的沪市交易日。"""
+    """获取起始日期至结束日期之间的沪市交易日。
+
+    使用 ``get_trading_dates`` 而非 ``get_trading_calendar``，避免部分客户端
+    因 ``download_holiday_data`` 未实现而抛 ``function not realize``。
+    """
     try:
         datetime.strptime(start_date, "%Y%m%d")
     except ValueError as exc:
@@ -82,90 +77,129 @@ def get_trading_dates(end_date: str, start_date: str = START_DATE) -> list[str]:
     if start_date > end_date:
         raise ValueError(f"start_date {start_date} 不能晚于结束日期 {end_date}")
 
-    dates: list[str] = xtdata.get_trading_calendar(
-        market="SH",
-        start_time=start_date,
-        end_time=end_date,
+    timestamps: list[int] = xtdata.get_trading_dates(
+        market="SH", start_time=start_date, end_time=end_date, count=-1
     )
-    return [str(date) for date in dates if start_date <= str(date) <= end_date]
+    dates: list[str] = [
+        datetime.fromtimestamp(ts / 1000).strftime("%Y%m%d") for ts in timestamps
+    ]
+    return [d for d in dates if start_date <= d <= end_date]
 
 
-def get_stock_open_dates(
-    stock_codes: list[str],
-    start_date: str = START_DATE,
-) -> dict[str, str]:
-    """获取股票 IPO 日期；日期缺失时按起始日期处理，避免漏下数据。"""
-    open_dates: dict[str, str] = {}
-
-    for code in stock_codes:
-        detail: dict[str, Any] | None = xtdata.get_instrument_detail(code)
-        open_date: str = str((detail or {}).get("OpenDate", "")).strip()
-        if len(open_date) != 8 or not open_date.isdigit():
-            open_date = start_date
-        open_dates[code] = open_date
-
-    return open_dates
+def _index_to_yyyymmdd(idx: Any) -> str | None:
+    """把 get_market_data_ex 的单根 index 转成 YYYYMMDD。"""
+    if idx is None:
+        return None
+    if hasattr(idx, "strftime"):
+        return str(idx.strftime("%Y%m%d"))
+    if isinstance(idx, (int, float)):
+        return datetime.fromtimestamp(int(idx) / 1000).strftime("%Y%m%d")
+    text: str = str(idx).replace("-", "").replace(" ", "")
+    if len(text) >= 8 and text[:8].isdigit():
+        return text[:8]
+    return None
 
 
-def get_missing_stock_codes(stock_codes: list[str], trade_date: str) -> list[str]:
-    """返回指定交易日在 xtquant 本地缓存中没有日线的代码。"""
-    missing_codes: list[str] = []
-
-    for start in range(0, len(stock_codes), BATCH_SIZE):
-        batch: list[str] = stock_codes[start : start + BATCH_SIZE]
-        local_data: dict[str, Any] = xtdata.get_local_data(
-            field_list=["time"],
-            stock_list=batch,
-            period="1d",
-            start_time=trade_date,
-            end_time=trade_date,
-            count=-1,
-            dividend_type="none",
-            fill_data=False,
-        )
-        time_frame: Any = local_data.get("time")
-
-        if time_frame is None or time_frame.empty:
-            missing_codes.extend(batch)
-            continue
-
-        present_codes: set[str] = set(time_frame.dropna(how="all").index)
-        missing_codes.extend(code for code in batch if code not in present_codes)
-
-    return missing_codes
-
-
-def download_stock_codes(
+def get_last_bar_dates(
     engine: "ScriptEngine",
     stock_codes: list[str],
-    trade_date: str,
-) -> bool:
-    """下载指定交易日的代码；完整执行返回 True，用户停止时返回 False。"""
+    end_date: str,
+) -> dict[str, str] | None:
+    """读取各标的本地缓存中最后一根前复权日线日期。用户停止时返回 None。
+
+    MiniQMT 本地只存未复权 K 线；``dividend_type=front`` 在读取时复权，
+    与选股脚本口径一致。有 K 线但复权因子缺失时会视为未覆盖，从而再补下载。
+    """
+    last_dates: dict[str, str] = {}
     total: int = len(stock_codes)
 
-    for start in range(0, total, BATCH_SIZE):
-        if not engine.strategy_active:
-            engine.write_log(
-                f"下载已停止：{trade_date} 已补充约 {start}/{total} 个标的"
-            )
-            return False
+    for start in range(0, total, READ_BATCH_SIZE):
+        if not engine.is_active():
+            engine.write_log(f"读取本地日期已停止：已处理 {start}/{total}")
+            return None
 
-        batch: list[str] = stock_codes[start : start + BATCH_SIZE]
-        on_progress: Callable[[dict[str, Any]], None] = create_progress_callback(
-            engine=engine,
-            batch_base=start,
-            batch_size=len(batch),
-            total=total,
-        )
-
-        xtdata.download_history_data2(
+        batch: list[str] = stock_codes[start : start + READ_BATCH_SIZE]
+        data: dict[str, Any] = xtdata.get_market_data_ex(
+            field_list=["close"],
             stock_list=batch,
             period="1d",
-            start_time=trade_date,
-            end_time=trade_date,
-            callback=on_progress,
+            start_time="",
+            end_time=end_date,
+            count=1,
+            dividend_type=DIVIDEND_TYPE,
+            fill_data=False,
+        )
+        for code in batch:
+            df = data.get(code)
+            if df is None or len(df) == 0:
+                continue
+            bar_date: str | None = _index_to_yyyymmdd(df.index[-1])
+            if bar_date:
+                last_dates[code] = bar_date
+
+        engine.write_log(
+            f"本地最后日期进度：{min(start + len(batch), total)}/{total}"
         )
 
+    return last_dates
+
+
+def _year_ranges(start_date: str, end_date: str) -> list[tuple[str, str]]:
+    """把闭区间按自然年切开，每年仍一次调用。"""
+    ranges: list[tuple[str, str]] = []
+    year: int = int(start_date[:4])
+    end_year: int = int(end_date[:4])
+    while year <= end_year:
+        lo: str = start_date if year == int(start_date[:4]) else f"{year}0101"
+        hi: str = end_date if year == end_year else f"{year}1231"
+        ranges.append((lo, hi))
+        year += 1
+    return ranges
+
+
+def download_history(
+    engine: "ScriptEngine",
+    stock_codes: list[str],
+    start_time: str,
+    end_time: str,
+    label: str,
+) -> bool:
+    """一次传入全部代码下载区间日线。开始前检查停止；调用期间无法中断。
+
+    返回是否调用成功（异常为 False）。用户在调用前已停止则返回 False。
+    """
+    if not engine.is_active():
+        engine.write_log(f"{label}已停止（尚未开始）")
+        return False
+
+    total: int = len(stock_codes)
+    engine.write_log(
+        f"{label}：{total} 个标的，{start_time} 至 {end_time}，一次全量 incrementally"
+    )
+    last_logged: list[int] = [0]
+
+    def on_progress(data: dict[str, Any]) -> None:
+        finished: int = int(data.get("finished") or data.get("done") or 0)
+        total_n: int = int(data.get("total") or total)
+        if (
+            finished == 1
+            or finished >= total_n
+            or finished - last_logged[0] >= DOWNLOAD_LOG_EVERY
+        ):
+            last_logged[0] = finished
+            msg: str = str(data.get("message", "")).strip()
+            extra: str = f"，{msg}" if msg else ""
+            engine.write_log(f"{label}进度：{finished}/{total_n}{extra}")
+
+    xtdata.download_history_data2(
+        stock_list=stock_codes,
+        period="1d",
+        start_time=start_time,
+        end_time=end_time,
+        callback=on_progress,
+        incrementally=True,
+    )
+    engine.write_log(f"{label}完成")
     return True
 
 
@@ -173,8 +207,8 @@ def run(engine: "ScriptEngine", start_date: str = START_DATE) -> None:
     """ScriptTrader 策略入口。
 
     ``start_date`` 指定下载起始日期（YYYYMMDD，包含当天），默认 ``START_DATE``。
-    选股脚本 select_near_ma_xtquant.py 的均线需从更早的固定日期起算，可把起点
-    前移（如 "20220427"），或改用薄包装脚本 download_xtquant_for_ma.py 传入。
+    选股脚本的均线需从更早的固定日期起算，可把起点前移，或改用
+    ``download_xtquant_for_ma.py`` 传入。
     """
     end_date: str = datetime.now().strftime("%Y%m%d")
     stock_codes: list[str] = get_all_stock_codes(engine)
@@ -189,48 +223,47 @@ def run(engine: "ScriptEngine", start_date: str = START_DATE) -> None:
         raise RuntimeError(
             f"xtquant 未返回 {start_date} 至 {end_date} 之间的交易日，请检查交易日历"
         )
+    latest: str = trading_dates[-1]
 
     engine.write_log(
         f"开始检查 {start_date} 至 {end_date} 的日线数据，"
-        f"共 {len(trading_dates)} 个交易日、{len(stock_codes)} 个标的"
+        f"共 {len(trading_dates)} 个交易日、{len(stock_codes)} 个标的，"
+        f"最新交易日 {latest}"
     )
-    engine.write_log("正在读取标的上市日期")
-    open_dates: dict[str, str] = get_stock_open_dates(stock_codes, start_date)
 
-    skipped_dates: int = 0
-    downloaded_dates: int = 0
-    downloaded_codes: int = 0
+    last_dates: dict[str, str] | None = get_last_bar_dates(
+        engine, stock_codes, end_date
+    )
+    if last_dates is None:
+        return
 
-    for index, trade_date in enumerate(trading_dates, start=1):
-        if not engine.strategy_active:
-            engine.write_log(
-                f"任务已停止，已检查 {index - 1}/{len(trading_dates)} 个交易日"
-            )
-            return
-
-        engine.write_log(f"检查交易日 {trade_date}（{index}/{len(trading_dates)}）")
-        listed_codes: list[str] = [
-            code for code in stock_codes if open_dates[code] <= trade_date
-        ]
-        missing_codes: list[str] = get_missing_stock_codes(listed_codes, trade_date)
-
-        if not missing_codes:
-            skipped_dates += 1
-            engine.write_log(f"{trade_date} 本地数据完整，跳过")
-            continue
-
-        engine.write_log(
-            f"{trade_date} 缺少 {len(missing_codes)}/{len(listed_codes)} 个已上市标的，"
-            "开始下载"
-        )
-        if not download_stock_codes(engine, missing_codes, trade_date):
-            return
-
-        downloaded_dates += 1
-        downloaded_codes += len(missing_codes)
-
+    need_codes: list[str] = [
+        code for code in stock_codes if last_dates.get(code, "") < latest
+    ]
+    complete: int = len(stock_codes) - len(need_codes)
     engine.write_log(
-        f"历史日线补全完成：检查 {len(trading_dates)} 个交易日，"
-        f"跳过完整日期 {skipped_dates} 个，下载 {downloaded_dates} 个日期的"
-        f" {downloaded_codes} 条标的任务"
+        f"本地已覆盖最新交易日 {complete} 个，需补齐 {len(need_codes)} 个"
     )
+    if not need_codes:
+        engine.write_log("本地日线已完整，无需下载")
+        return
+
+    try:
+        if download_history(
+            engine, need_codes, start_date, end_date, "全区间下载"
+        ):
+            engine.write_log("历史日线补全完成")
+        return
+    except Exception as exc:  # noqa: BLE001 - 全区间失败则按年重试
+        engine.write_log(f"全区间一次下载失败，改为按年补齐：{exc}")
+
+    for lo, hi in _year_ranges(start_date, end_date):
+        if not engine.is_active():
+            engine.write_log("按年下载已停止")
+            return
+        try:
+            download_history(engine, need_codes, lo, hi, f"{lo[:4]}年下载")
+        except Exception as year_exc:  # noqa: BLE001 - 单年失败继续下一年
+            engine.write_log(f"{lo[:4]}年下载异常：{year_exc}")
+
+    engine.write_log("历史日线补全完成")

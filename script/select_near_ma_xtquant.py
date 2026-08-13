@@ -384,6 +384,7 @@ def _score_symbol(
     返回 ``{near_dates, near_days, near_values, score, close, high52w}`` 或 None（跳过）：
     - T 日无收盘价 → 跳过整个标的
     - REQUIRE_HALVED 且未腰斩 → 跳过整个标的（硬过滤）
+    - 上市日晚于均线起点 → 该均线无效（不能把「上市以来均价」当成更早的成本均线）
     - 某均线窗口有效交易日数 < MIN_WINDOW_POINTS → 该均线无效，不进分子也不进分母
     - 分母只含有效均线，避免无效均线系统性低估分数
     """
@@ -402,9 +403,13 @@ def _score_symbol(
     near_values: list[float] = []
     near_weight: float = 0.0
     valid_weight_total: float = 0.0
+    listed: str = str(close.dropna().index[0])
 
     for fixed_date in FIXED_DATES:
         start: str = window_start[fixed_date]
+        # 起点当天还没上市：这条成本均线不成立，不能退化成「上市日均价」。
+        if listed > start:
+            continue
         window: pd.Series = close.loc[start:trade_date]
         valid: pd.Series = window.dropna()
         n: int = valid.size

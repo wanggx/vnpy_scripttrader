@@ -1,11 +1,12 @@
 """为成本均线选股脚本一次性下载全市场 A 股全量日线。
 
-select_near_ma_xtquant.py 的成本均线需从最早固定日期起算，其调度逻辑只读
-MiniQMT 本地缓存、不再下载。首次使用前请运行本脚本拉取全量历史；之后按需
-重跑本脚本或 download_xtquant_daily.py 补全最新数据即可。
+select_near_ma_xtquant.py / select_near_ma_all_xtquant.py 的成本均线需从最早
+固定日期起算。首次使用前请运行本脚本拉取全量历史；之后按需重跑本脚本或
+download_xtquant_daily.py 补缺口即可（incrementally，已有的不重下）。
 
 下载起点直接取选股脚本 ``FIXED_DATES`` 的最早值，避免两处硬编码不同步导致
-均线窗口数据缺失。
+均线窗口数据缺失。实际下载逻辑见 ``download_xtquant_daily.py``：按标的看
+本地最后一根，缺的一次传入全部代码拉区间，不再按天扫描、不再 500 一批循环。
 """
 
 from typing import TYPE_CHECKING
