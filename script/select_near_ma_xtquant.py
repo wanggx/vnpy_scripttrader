@@ -43,6 +43,11 @@ FIXED_DATES: list[str] = ["20220427", "20221031", "20240205", "20240918", "20250
 MIN_BARS: int = 100
 # 接近标准：|close - ma| / ma <= NEAR_THRESHOLD。
 NEAR_THRESHOLD: float = 0.01
+# 近 N 个交易日（不含 T）若收盘跌穿该均线（低于均线超过 BREAK_THRESHOLD），
+# 即使 T 日又回到均线附近也不算接近——跌穿后反抽不算有效贴近。
+BREAK_LOOKBACK: int = 20
+# 跌穿幅度：收盘低于当时均线超过该比例才算跌穿（3 个点）。
+BREAK_THRESHOLD: float = 0.03
 # 选前 N 个标的入库。
 TOP_N: int = 100
 # 仅保留最近 N 天的数据。
@@ -373,6 +378,28 @@ def _is_halved(close: pd.Series, high: pd.Series, trade_date: str) -> bool:
     return close_t <= high_max * HALF_RATIO
 
 
+def _broke_below_ma(valid: pd.Series, trade_date: str) -> bool:
+    """近 ``BREAK_LOOKBACK`` 个交易日（不含 T）是否有收盘跌穿当时均线。
+
+    当时均线 = 从该均线窗口起点到当天的前复权收盘价均值。
+    跌穿：``close < ma × (1 - BREAK_THRESHOLD)``（默认低 3 个点），比接近带
+    （1%）宽，避免把带内下沿或浅幅跌破也当成跌穿。
+    """
+    if trade_date not in valid.index:
+        return False
+    pos = valid.index.get_loc(trade_date)
+    if isinstance(pos, slice):
+        pos = int(pos.stop) - 1
+    if pos <= 0:
+        return False
+    hist: pd.Series = valid.iloc[:pos]
+    look: pd.Series = hist.iloc[-BREAK_LOOKBACK:]
+    if look.empty:
+        return False
+    ma_hist: pd.Series = hist.expanding(min_periods=1).mean()
+    return bool((look < ma_hist.reindex(look.index) * (1.0 - BREAK_THRESHOLD)).any())
+
+
 def _score_symbol(
     close: pd.Series,
     high: pd.Series,
@@ -386,6 +413,7 @@ def _score_symbol(
     - REQUIRE_HALVED 且未腰斩 → 跳过整个标的（硬过滤）
     - 上市日晚于均线起点 → 该均线无效（不能把「上市以来均价」当成更早的成本均线）
     - 某均线窗口有效交易日数 < MIN_WINDOW_POINTS → 该均线无效，不进分子也不进分母
+    - T 日接近该均线，但近 BREAK_LOOKBACK 日曾跌穿 → 不算接近（跌穿后反抽不计入）
     - 分母只含有效均线，避免无效均线系统性低估分数
     """
     if trade_date not in close.index:
@@ -421,6 +449,8 @@ def _score_symbol(
         weight: float = _weight(n)
         valid_weight_total += weight
         if abs(close_t - ma) / ma <= NEAR_THRESHOLD:
+            if _broke_below_ma(valid, trade_date):
+                continue
             near_dates.append(fixed_date)
             near_days.append(n)
             near_values.append(round(ma, 2))
