@@ -8,10 +8,10 @@
 开 ``REQUIRE_HALVED`` 时，额外要求 T 日收盘价相对近 ``HIGH_LOOKBACK`` 个交易日
 最高价已腰斩（``close <= 最高价 × HALF_RATIO``），未腰斩的标的在打分前整批剔除。
 
-需 MiniQMT 运行后经 ScriptTrader 执行（与 ``download_xtquant_daily.py`` 相同约束）。
-所需历史由 ``download_xtquant_for_ma.py`` 预先下载到 xtquant 本地缓存；本脚本每轮
-仅为目标申万行业增量下载当日新日线，再用全区间读取计算均线（前复权下历史价会随分红
-整体位移）。
+需大 QMT + xtquant-big-convert RPC 桥运行后经 ScriptTrader 执行（不再依赖 MiniQMT）。
+行情经 ``bigqmt_xtdata`` 读大 QMT 终端本地库；缺历史请在终端「数据管理」补全，
+``download_history_data2`` 在大 QMT 上常不可用，本脚本仅尽力补当日。前复权下历史价
+会随分红整体位移，故每轮仍读全区间计算均线。
 
 默认每个交易日收盘后 16:00 执行一次并长期循环：启动后等待下一个 16:00 才首次
 执行，周末/节假日（非交易日）跳过，单轮失败等下一轮，用户停止则退出调度。
@@ -27,8 +27,9 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
-from xtquant import xtdata
 
+import bigqmt_xtdata
+from bigqmt_xtdata import instrument_name, xtdata
 from vnpy_sqlapp import APP_NAME
 
 if TYPE_CHECKING:
@@ -63,8 +64,8 @@ EXCLUDE_ST: bool = True
 REQUIRE_HALVED: bool = True
 HALF_RATIO: float = 0.5
 HIGH_LOOKBACK: int = 252
-# 每批读取的标的数量，批间响应停止操作。
-BATCH_SIZE: int = 500
+# 每批读取的标的数量；BigQMT RPC 单次超时有限，默认与桥内 chunk 对齐。
+BATCH_SIZE: int = bigqmt_xtdata.READ_BATCH_SIZE
 # 结果表名。
 TABLE_NAME: str = "stock_near_ma"
 # xtquant 中的完整 sector 名称；多个板块用英文逗号分隔。
@@ -194,7 +195,7 @@ def _filter_universe(
         detail: dict[str, Any] | None = xtdata.get_instrument_detail(code)
         if not detail:
             continue
-        name: str = str(detail.get("InstrumentName", "")).strip()
+        name: str = instrument_name(detail)
         if EXCLUDE_ST and "ST" in name.upper():
             continue
         kept.append((code, name))
@@ -206,47 +207,48 @@ def _download_today(
     universe: list[tuple[str, str]],
     trade_date: str,
 ) -> bool:
-    """增量下载当日日线到 MiniQMT 本地缓存，只补当天不重下历史。
+    """尽力补当日日线（大 QMT 上 download 常不可用，失败不阻断读数）。
 
-    ``get_market_data_ex`` 只读缓存、不自动下载，故每轮需先补当日新 bar。
-    ``start_time=end_time=trade_date`` 只取当天，``incrementally=True`` 仅补
-    缓存缺失部分（已缓存不重下），全量历史由 ``download_xtquant_for_ma.py``
-    一次性拉、日常仅增量当天。单批失败记日志继续、不中断（读缓存兜底）。
+    BigQMT 的 ``get_market_data_ex`` 读的是交易端本地库；若终端已在「数据管理」
+    补过日线，即使本函数失败仍可继续选股。一次传入全部代码，避免分批 RPC 打挂。
     返回是否完整执行（用户停止返回 False）。
     """
+    if not engine.is_active():
+        engine.write_log("当日下载已停止（尚未开始）")
+        return False
+
     codes: list[str] = [code for code, _ in universe]
     total: int = len(codes)
-    engine.write_log(f"开始增量下载当日日线（{trade_date}）：{total} 个标的")
+    engine.write_log(
+        f"开始尽力补当日日线（{trade_date}）：{total} 个标的（大 QMT 上可能不可用）"
+    )
     last_logged: list[int] = [0]
 
     def on_progress(data: dict[str, Any]) -> None:
-        done: int = data.get("done", 0)
-        total_n: int = data.get("total", total)
-        if done - last_logged[0] >= 500 or done >= total_n:
-            last_logged[0] = done
-            engine.write_log(f"当日下载进度：{done}/{total_n}")
+        finished: int = int(data.get("finished") or data.get("done") or 0)
+        total_n: int = int(data.get("total") or total)
+        if (
+            finished == 1
+            or finished >= total_n
+            or finished - last_logged[0] >= 200
+        ):
+            last_logged[0] = finished
+            msg: str = str(data.get("message", "")).strip()
+            extra: str = f"，{msg}" if msg else ""
+            engine.write_log(f"当日下载进度：{finished}/{total_n}{extra}")
 
-    for start in range(0, total, BATCH_SIZE):
-        if not engine.is_active():
-            engine.write_log(f"当日下载已停止：已补充约 {start}/{total} 个标的")
-            return False
-
-        batch: list[str] = codes[start : start + BATCH_SIZE]
-        try:
-            xtdata.download_history_data2(
-                stock_list=batch,
-                period="1d",
-                start_time=trade_date,
-                end_time=trade_date,
-                callback=on_progress,
-                incrementally=True,
-            )
-            engine.write_log(
-                f"当日批次下载完成：已补充 {min(start + len(batch), total)}/{total} 个标的"
-            )
-        except Exception as exc:  # noqa: BLE001 - 单批失败记日志继续，读缓存兜底
-            engine.write_log(f"当日批次下载异常（{batch[0]}~{batch[-1]}）：{exc}")
-    engine.write_log("当日日线下载完成")
+    try:
+        xtdata.download_history_data2(
+            stock_list=codes,
+            period="1d",
+            start_time=trade_date,
+            end_time=trade_date,
+            callback=on_progress,
+            incrementally=True,
+        )
+        engine.write_log(f"当日日线下载完成：{total} 个标的")
+    except Exception as exc:  # noqa: BLE001 - 大 QMT 下载失败时改读终端已有数据
+        engine.write_log(f"当日日线下载不可用/失败，改用终端已有数据：{exc}")
     return True
 
 
@@ -588,8 +590,8 @@ def _run_sector(
         return
     if not series_map:
         raise RuntimeError(
-            "未读到任何行情数据，请先运行 download_xtquant_for_ma.py "
-            "下载全量日线到 xtquant 本地缓存"
+            "未读到任何行情数据。请在大 QMT「数据管理」补全日线后重试，"
+            "或运行 download_xtquant_for_ma.py（经 BigQMT RPC 尽力下载）"
         )
     engine.write_log(f"读到 {len(series_map)} 个标的的行情")
 
@@ -663,6 +665,10 @@ def _run_once(
     driver: str = getattr(sql_engine.database, "driver_name", "sqlite")
     engine.write_log(f"SqlApp 已就绪，数据库驱动：{driver}")
 
+    if not bigqmt_xtdata.ping(engine):
+        engine.write_log("大 QMT RPC 不可用，本轮结束（请确认终端已加载 BIGQMT 服务端）")
+        return
+
     sector_names: list[str] = [
         name.strip() for name in target_sector_name.split(",") if name.strip()
     ]
@@ -671,11 +677,10 @@ def _run_once(
         return
 
     try:
-        engine.write_log("正在更新 xtquant 板块分类数据")
+        engine.write_log("正在更新大 QMT 板块分类数据")
         xtdata.download_sector_data()
-    except Exception as exc:  # noqa: BLE001 - xtquant 异常只记录并结束本轮
-        engine.write_log(f"更新 xtquant 板块分类数据失败：{exc}")
-        return
+    except Exception as exc:  # noqa: BLE001 - 失败不阻断，成分可能已可用
+        engine.write_log(f"更新板块分类数据失败（继续用已有成分）：{exc}")
 
     total: int = len(sector_names)
     for index, sector_name in enumerate(sector_names, start=1):

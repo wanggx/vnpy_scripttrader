@@ -4,13 +4,11 @@
 区别只在标的池：本脚本跑全部沪深京 A 股，结果以 ``sector_name=沪深京A股``
 写入同一张 ``stock_near_ma``（与申万板块结果互不覆盖）。
 
-当日日线用一次 ``download_history_data2`` 传入全部代码。分批调用会把
-MiniQMT 下载会话打挂（无回调、界面假死）；全量一次传入实测约 2.5 分钟可完成。
-进度回调字段为 ``finished``（不是 ``done``）。
+经 BigQMT RPC（``bigqmt_xtdata``）读大 QMT 终端本地库，不再依赖 MiniQMT。
+当日下载尽力而为（大 QMT 上常不可用）；缺历史请在终端「数据管理」补。
+读行情按 ``READ_BATCH_SIZE`` 分批以适配 RPC 超时。
 
-需 MiniQMT 运行后经 ScriptTrader 执行。历史日线仍由
-``download_xtquant_for_ma.py`` 预先下载到本地缓存。调度与行业版相同：
-每个交易日 16:00 执行，启动后等下一个 16:00，非交易日跳过。
+调度与行业版相同：每个交易日 16:00 执行，启动后等下一个 16:00，非交易日跳过。
 """
 
 # pylint: disable=protected-access
@@ -20,7 +18,8 @@ import traceback
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from xtquant import xtdata
+import bigqmt_xtdata
+from bigqmt_xtdata import instrument_name, xtdata
 
 # 复用行业版的打分/落库/调度，避免两套规则漂移。
 import select_near_ma_xtquant as ma
@@ -38,11 +37,11 @@ PRIMARY_SECTOR: str = "沪深京A股"
 FALLBACK_SECTORS: tuple[str, ...] = ("沪深A股", "京市A股")
 # 入库时的 sector_name，与申万行业版共用表、靠主键区分。
 SECTOR_NAME: str = PRIMARY_SECTOR
-# 合约信息批量读取；get_market_data_ex 仍按此分批（读缓存不会打挂下载通道）。
-NAME_BATCH_SIZE: int = 500
-READ_BATCH_SIZE: int = 500
+# BigQMT 无 get_instrument_detail_list，名称仍逐批读；行情批大小与桥对齐。
+NAME_BATCH_SIZE: int = 50
+READ_BATCH_SIZE: int = bigqmt_xtdata.READ_BATCH_SIZE
 # 下载进度日志间隔（callback.finished）。
-DOWNLOAD_LOG_EVERY: int = 500
+DOWNLOAD_LOG_EVERY: int = 200
 
 
 def _get_all_stock_codes(engine: ScriptEngine) -> list[str]:
@@ -64,7 +63,7 @@ def _filter_universe(
     engine: ScriptEngine,
     stock_codes: list[str],
 ) -> list[tuple[str, str]] | None:
-    """批量读合约信息，排除 ST/*ST 与信息缺失的标的。用户停止时返回 None。"""
+    """读合约信息，排除 ST/*ST。BigQMT 无批量 detail 接口，按 NAME_BATCH_SIZE 逐个查。"""
     engine.write_log(f"正在读取 {len(stock_codes)} 个标的的合约信息（排除ST）")
     kept: list[tuple[str, str]] = []
     total: int = len(stock_codes)
@@ -75,12 +74,14 @@ def _filter_universe(
             return None
 
         batch: list[str] = stock_codes[start : start + NAME_BATCH_SIZE]
-        details: dict[str, Any] = xtdata.get_instrument_detail_list(batch) or {}
         for code in batch:
-            detail: dict[str, Any] | None = details.get(code)
-            if not detail:
+            try:
+                detail: dict[str, Any] | None = xtdata.get_instrument_detail(code)
+            except Exception:  # noqa: BLE001 - 单标的失败跳过
                 continue
-            name: str = str(detail.get("InstrumentName", "")).strip()
+            name: str = instrument_name(detail)
+            if not name and not detail:
+                continue
             if ma.EXCLUDE_ST and "ST" in name.upper():
                 continue
             kept.append((code, name))
@@ -95,13 +96,7 @@ def _download_today(
     universe: list[tuple[str, str]],
     trade_date: str,
 ) -> bool:
-    """一次传入全部代码，增量补当日日线。
-
-    不要按 200/500 循环调用 ``download_history_data2``：连续分批会把 MiniQMT
-    下载通道打挂（callback 不再触发，调用永不返回）。全市场一次传入可跑完。
-    本次调用期间无法响应停止（xtquant 同步阻塞）；开始前检查一次 is_active。
-    失败只记日志，后续读缓存兜底。
-    """
+    """尽力补当日日线；大 QMT 下载失败不阻断，改读终端已有数据。"""
     if not engine.is_active():
         engine.write_log("当日下载已停止（尚未开始）")
         return False
@@ -109,12 +104,11 @@ def _download_today(
     codes: list[str] = [code for code, _ in universe]
     total: int = len(codes)
     engine.write_log(
-        f"开始增量下载当日日线（{trade_date}）：{total} 个标的（一次全量，勿分批）"
+        f"开始尽力补当日日线（{trade_date}）：{total} 个标的（大 QMT 上可能不可用）"
     )
     last_logged: list[int] = [0]
 
     def on_progress(data: dict[str, Any]) -> None:
-        # xtquant 实际字段是 finished；兼容误用 done 的旧文档。
         finished: int = int(data.get("finished") or data.get("done") or 0)
         total_n: int = int(data.get("total") or total)
         if (
@@ -136,11 +130,9 @@ def _download_today(
             callback=on_progress,
             incrementally=True,
         )
-    except Exception as exc:  # noqa: BLE001 - 下载失败不中断，读缓存兜底
-        engine.write_log(f"当日日线下载异常，将改用本地缓存：{exc}")
-        return True
-
-    engine.write_log(f"当日日线下载完成：{total} 个标的")
+        engine.write_log(f"当日日线下载完成：{total} 个标的")
+    except Exception as exc:  # noqa: BLE001
+        engine.write_log(f"当日日线下载不可用/失败，改用终端已有数据：{exc}")
     return True
 
 
@@ -150,7 +142,7 @@ def _load_bar_series(
     start_time: str,
     end_time: str,
 ) -> dict[str, pd.DataFrame] | None:
-    """先一次补当日日线，再分批读全区间前复权 close/high。"""
+    """先尽力补当日，再分批读全区间前复权 close/high。"""
     if not _download_today(engine, universe, end_time):
         return None
 
@@ -204,16 +196,19 @@ def _run_once(engine: ScriptEngine) -> None:
     driver: str = getattr(sql_engine.database, "driver_name", "sqlite")
     engine.write_log(f"SqlApp 已就绪，数据库驱动：{driver}")
 
-    try:
-        engine.write_log("正在更新 xtquant 板块分类数据")
-        xtdata.download_sector_data()
-    except Exception as exc:  # noqa: BLE001 - 板块更新失败则本轮结束
-        engine.write_log(f"更新 xtquant 板块分类数据失败：{exc}")
+    if not bigqmt_xtdata.ping(engine):
+        engine.write_log("大 QMT RPC 不可用，本轮结束")
         return
+
+    try:
+        engine.write_log("正在更新大 QMT 板块分类数据")
+        xtdata.download_sector_data()
+    except Exception as exc:  # noqa: BLE001 - 板块更新失败不阻断（成分可能已有）
+        engine.write_log(f"更新板块分类数据失败（继续用已有成分）：{exc}")
 
     stock_codes: list[str] = _get_all_stock_codes(engine)
     if not stock_codes:
-        engine.write_log("xtquant 未返回任何 A 股代码，本轮结束")
+        engine.write_log("大 QMT 未返回任何 A 股代码，本轮结束")
         return
     engine.write_log(f"全市场标的池“{SECTOR_NAME}”：{len(stock_codes)} 个")
 
@@ -230,7 +225,7 @@ def _run_once(engine: ScriptEngine) -> None:
     calendar: list[str] = ma._get_trading_dates(ma.FIXED_DATES[0], end_date)
     if not calendar:
         raise RuntimeError(
-            f"xtquant 未返回 {ma.FIXED_DATES[0]} 至 {end_date} 的交易日，请检查 xtquant 连接"
+            f"大 QMT 未返回 {ma.FIXED_DATES[0]} 至 {end_date} 的交易日，请检查 RPC"
         )
     window_start: dict[str, str] = {
         fixed_date: min(d for d in calendar if d >= fixed_date)
@@ -248,8 +243,7 @@ def _run_once(engine: ScriptEngine) -> None:
         return
     if not series_map:
         raise RuntimeError(
-            "未读到任何行情数据，请先运行 download_xtquant_for_ma.py "
-            "下载全量日线到 xtquant 本地缓存"
+            "未读到任何行情数据。请在大 QMT「数据管理」补全日线后重试"
         )
     engine.write_log(f"读到 {len(series_map)} 个标的的行情")
 
@@ -308,7 +302,7 @@ def run(engine: ScriptEngine) -> None:
     """ScriptTrader 策略入口：每个交易日 16:00 对全市场 A 股执行选股。"""
     engine.write_log(
         f"全市场选股调度启动：每交易日 {ma.RUN_HOUR:02d}:{ma.RUN_MINUTE:02d} 执行，"
-        f"标的池={SECTOR_NAME}，非交易日跳过，等待首个触发点..."
+        f"标的池={SECTOR_NAME}，数据源=大QMT RPC，非交易日跳过，等待首个触发点..."
     )
     while engine.is_active():
         wake_at: datetime = ma._next_run_dt(datetime.now())
