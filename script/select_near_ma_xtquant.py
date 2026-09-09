@@ -634,7 +634,6 @@ def _run_sector(
     engine.write_log(f"交易日历 {len(calendar)} 个，均线窗口起点：{window_start}")
 
     # D. 批量读取前复权收盘价/最高价（区间读到今天，便于 T 自动回退）。
-    engine.write_log(f"开始读取前复权行情（{start_min} 至 {end_date}）")
     series_map: dict[str, pd.DataFrame] | None = _load_bar_series(
         engine, universe, start_min, end_date
     )
