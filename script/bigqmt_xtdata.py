@@ -6,8 +6,8 @@
 前置：
 1. 大 QMT 已运行并加载 BIGQMT_* 服务端策略；
 2. 本机 VeighNa 所用 Python 已 ``pip install -e`` 安装 ``xtquant-big-convert``；
-3. ``bigqmt_signal_trader_client_config.py`` 可被 import（与 QMT 端账号/传输一致），
-   可放在 ``script/`` 下或任意已在 ``PYTHONPATH`` 的目录。
+3. ``script/bigqmt_signal_trader_client_config.py`` 存在（可从同目录
+   ``bigqmt_signal_trader_client_config.example.py`` 复制），账号/传输与 QMT 端一致。
 
 历史 K 线读的是大 QMT 终端本地库；缺周期请在终端「数据管理」补，
 ``download_history_data2`` 在大 QMT 上经常不可用，脚本侧只作尽力而为。
@@ -16,7 +16,15 @@
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 from typing import Any
+
+# 仅把本 script/ 放进 path，供同目录的 client_config 被 import（不含账号勿提交）。
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_script_dir_text = str(_SCRIPT_DIR)
+if _script_dir_text not in sys.path:
+    sys.path.insert(0, _script_dir_text)
 
 from bigqmt_signal_trader.xtquant_compat import configure, xtdata as _bq_xtdata
 

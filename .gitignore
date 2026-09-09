@@ -127,3 +127,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# BigQMT 客户端私密配置（含账号）；用同目录 example 复制后填写
+script/bigqmt_signal_trader_client_config.py
+script/bigqmt_signal_trader_local_config.py
