@@ -9,9 +9,9 @@
 最高价已腰斩（``close <= 最高价 × HALF_RATIO``），未腰斩的标的在打分前整批剔除。
 
 需大 QMT + xtquant-big-convert RPC 桥运行后经 ScriptTrader 执行（不再依赖 MiniQMT）。
-行情经 ``bigqmt_xtdata`` 一次分批读全区间；若末根未到目标日，再只对缺数代码
-小批次 ``download_history_data2`` 并重读这些代码（禁止一次丢全市场、也不先全市场
-``count=1`` 探两遍）。前复权下历史价会随分红整体位移，故每轮仍读全区间算均线。
+行情经 ``bigqmt_xtdata`` 读终端本地库：先 ``count=1`` 探各标的末根日期，缺目标日的
+按小批次补数，再一次分批读全区间（禁止一次丢全市场 download）。前复权下历史价会随
+分红整体位移，故每轮仍读全区间计算均线。
 
 默认每个交易日收盘后 16:00 执行一次并长期循环：启动后等待下一个 16:00 才首次
 执行，周末/节假日（非交易日）跳过，单轮失败等下一轮，用户停止则退出调度。
@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 
 import bigqmt_xtdata
+import download_xtquant_daily as xt_daily
 from bigqmt_xtdata import instrument_name, xtdata
 from vnpy_sqlapp import APP_NAME
 
@@ -202,34 +203,48 @@ def _filter_universe(
     return kept
 
 
-def _series_last_date(bars: pd.DataFrame | None) -> str:
-    """已规范化 bars 的最后有效收盘日期；无数据返回空串。"""
-    if bars is None or len(bars) == 0:
-        return ""
-    valid = bars["close"].dropna()
-    if valid.empty:
-        return ""
-    return str(valid.index[-1])
-
-
-def _download_missing_daily(
+def _download_today(
     engine: ScriptEngine,
-    codes: list[str],
+    universe: list[tuple[str, str]],
     trade_date: str,
 ) -> bool:
-    """对缺 ``trade_date`` 的代码分批 ``download_history_data2``。用户停止返回 False。"""
-    if not codes:
-        return True
-    batch_size: int = max(1, bigqmt_xtdata.DOWNLOAD_TODAY_BATCH_SIZE)
+    """先 ``count=1`` 探本地末根，再仅对缺 ``trade_date`` 的标的分批补数。
+
+    缺的才 ``download_history_data2``，且按小批次，禁止一次塞入全市场。
+    下载失败不阻断。用户停止返回 False。
+    """
+    if not engine.is_active():
+        engine.write_log("当日数据准备已停止（尚未开始）")
+        return False
+
+    codes: list[str] = [code for code, _ in universe]
     total: int = len(codes)
-    engine.write_log(
-        f"开始分批补缺当日日线（{trade_date}）：{total} 只，每批 {batch_size}"
+    engine.write_log(f"正在探查终端本地日线覆盖（目标日 {trade_date}，{total} 只）")
+    last_dates: dict[str, str] | None = xt_daily.get_last_bar_dates(
+        engine, codes, trade_date
     )
-    for start in range(0, total, batch_size):
+    if last_dates is None:
+        return False
+
+    need: list[str] = [
+        code for code in codes if last_dates.get(code, "") < trade_date
+    ]
+    ready: int = total - len(need)
+    engine.write_log(
+        f"本地日线覆盖 {trade_date}：已有 {ready}/{total}，缺 {len(need)}"
+    )
+    if not need:
+        return True
+
+    batch_size: int = max(1, bigqmt_xtdata.DOWNLOAD_TODAY_BATCH_SIZE)
+    engine.write_log(
+        f"开始分批补缺当日日线（{trade_date}）：{len(need)} 只，每批 {batch_size}"
+    )
+    for start in range(0, len(need), batch_size):
         if not engine.is_active():
-            engine.write_log(f"当日补数已停止：{start}/{total}")
+            engine.write_log(f"当日补数已停止：{start}/{len(need)}")
             return False
-        batch: list[str] = codes[start : start + batch_size]
+        batch: list[str] = need[start : start + batch_size]
         try:
             xtdata.download_history_data2(
                 stock_list=batch,
@@ -240,33 +255,43 @@ def _download_missing_daily(
             )
         except Exception as exc:  # noqa: BLE001
             engine.write_log(
-                f"当日补数批次失败 {start + 1}-{start + len(batch)}/{total}：{exc}；"
-                "改用当前已读数据继续"
+                f"当日补数批次失败 {start + 1}-{start + len(batch)}/{len(need)}：{exc}；"
+                "改用当前本地已有数据继续"
             )
             return True
-        engine.write_log(f"当日补数进度：{min(start + len(batch), total)}/{total}")
-    engine.write_log(f"当日缺数补数请求已发完：{total} 只")
+        engine.write_log(
+            f"当日补数进度：{min(start + len(batch), len(need))}/{len(need)}"
+        )
+
+    engine.write_log(f"当日缺数补数请求已发完：{len(need)} 只")
     return True
 
 
-def _read_bar_batches(
+def _load_bar_series(
     engine: ScriptEngine,
-    codes: list[str],
+    universe: list[tuple[str, str]],
     start_time: str,
     end_time: str,
-    *,
-    progress_label: str = "读取行情进度",
 ) -> dict[str, pd.DataFrame] | None:
-    """分批 ``get_market_data_ex`` 读全区间 close/high。用户停止返回 None。"""
+    """分批读取全池前复权收盘价/最高价，返回 ``{code: DataFrame}``。
+
+    先 ``count=1`` 探覆盖并只对缺目标日的标的分批补数，再一次
+    ``get_market_data_ex`` 读全区间。用户停止返回 None。
+    """
+    if not _download_today(engine, universe, end_time):
+        return None
+
+    codes: list[str] = [code for code, _ in universe]
     result: dict[str, pd.DataFrame] = {}
     total: int = len(codes)
-    if total == 0:
-        return result
     logged_sample: bool = False
+    engine.write_log(
+        f"开始读取前复权行情（{start_time} 至 {end_time}，{total} 只）"
+    )
 
     for start in range(0, total, BATCH_SIZE):
         if not engine.is_active():
-            engine.write_log(f"读取已停止：已处理约 {start}/{total} 个标的")
+            engine.write_log(f"读取已停止：已补充约 {start}/{total} 个标的")
             return None
 
         batch: list[str] = codes[start : start + BATCH_SIZE]
@@ -294,71 +319,8 @@ def _read_bar_batches(
                 )
                 logged_sample = True
 
-        engine.write_log(
-            f"{progress_label}：{min(start + len(batch), total)}/{total}"
-        )
+        engine.write_log(f"读取行情进度：{min(start + len(batch), total)}/{total}")
 
-    return result
-
-
-def _load_bar_series(
-    engine: ScriptEngine,
-    universe: list[tuple[str, str]],
-    start_time: str,
-    end_time: str,
-) -> dict[str, pd.DataFrame] | None:
-    """分批读全池前复权 close/high；缺目标日则只补这些代码并重读它们。
-
-    流程（避免先全市场 ``count=1`` 再全市场全区间、扫两遍）：
-    1. 一次分批读 ``start_time→end_time``；
-    2. 用读到的末根日期判断谁缺 ``end_time``；
-    3. 仅对缺数代码小批次 download，再只重读这些代码并写回结果。
-
-    用户停止返回 None。``fill_data=False`` 让停牌留 NaN。
-    """
-    codes: list[str] = [code for code, _ in universe]
-    total: int = len(codes)
-    engine.write_log(
-        f"开始读取前复权行情（{start_time} 至 {end_time}，{total} 只）"
-    )
-    result: dict[str, pd.DataFrame] | None = _read_bar_batches(
-        engine, codes, start_time, end_time
-    )
-    if result is None:
-        return None
-
-    need: list[str] = [
-        code for code in codes if _series_last_date(result.get(code)) < end_time
-    ]
-    ready: int = total - len(need)
-    engine.write_log(
-        f"首轮读取后覆盖 {end_time}：已有 {ready}/{total}，缺 {len(need)}"
-    )
-    if not need:
-        return result
-
-    if not _download_missing_daily(engine, need, end_time):
-        return None
-
-    engine.write_log(f"补数后重读缺数标的：{len(need)} 只")
-    refreshed: dict[str, pd.DataFrame] | None = _read_bar_batches(
-        engine,
-        need,
-        start_time,
-        end_time,
-        progress_label="缺数重读进度",
-    )
-    if refreshed is None:
-        return None
-    result.update(refreshed)
-
-    still_miss: int = sum(
-        1 for code in need if _series_last_date(result.get(code)) < end_time
-    )
-    if still_miss:
-        engine.write_log(
-            f"补数后仍缺 {end_time}：{still_miss}/{len(need)} 只，将按实际读到的数据继续"
-        )
     return result
 
 
