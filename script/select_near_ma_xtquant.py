@@ -109,13 +109,13 @@ def _get_trading_dates(start_time: str, end_time: str) -> list[str]:
 
     ``xtdata.get_trading_calendar`` 会无条件调 ``download_holiday_data``，
     部分客户端不支持该功能会抛 ``function not realize``。这里改用
-    ``get_trading_dates`` 直接取交易所交易日时间戳（毫秒），不触发节假日
-    下载——其结果与交易日历在交易日范围内一致（节假日扩展只影响非交易日）。
+    ``get_trading_dates``。MiniQMT 多为毫秒时间戳，BigQMT 常直接给
+    YYYYMMDD 字符串，统一经 ``bigqmt_xtdata.trading_dates_to_yyyymmdd`` 规范化。
     """
-    timestamps: list[int] = xtdata.get_trading_dates(
+    raw = xtdata.get_trading_dates(
         market="SH", start_time=start_time, end_time=end_time, count=-1
     )
-    return [datetime.fromtimestamp(ts / 1000).strftime("%Y%m%d") for ts in timestamps]
+    return bigqmt_xtdata.trading_dates_to_yyyymmdd(raw)
 
 
 def _is_trading_day(date: datetime) -> bool:

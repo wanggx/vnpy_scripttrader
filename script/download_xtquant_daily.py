@@ -61,27 +61,16 @@ def get_trading_dates(end_date: str, start_date: str = START_DATE) -> list[str]:
     if start_date > end_date:
         raise ValueError(f"start_date {start_date} 不能晚于结束日期 {end_date}")
 
-    timestamps: list[int] = xtdata.get_trading_dates(
+    raw = xtdata.get_trading_dates(
         market="SH", start_time=start_date, end_time=end_date, count=-1
     )
-    dates: list[str] = [
-        datetime.fromtimestamp(ts / 1000).strftime("%Y%m%d") for ts in timestamps
-    ]
+    dates: list[str] = bigqmt_xtdata.trading_dates_to_yyyymmdd(raw)
     return [d for d in dates if start_date <= d <= end_date]
 
 
 def _index_to_yyyymmdd(idx: Any) -> str | None:
     """把 get_market_data_ex 的单根 index 转成 YYYYMMDD。"""
-    if idx is None:
-        return None
-    if hasattr(idx, "strftime"):
-        return str(idx.strftime("%Y%m%d"))
-    if isinstance(idx, (int, float)):
-        return datetime.fromtimestamp(int(idx) / 1000).strftime("%Y%m%d")
-    text: str = str(idx).replace("-", "").replace(" ", "")
-    if len(text) >= 8 and text[:8].isdigit():
-        return text[:8]
-    return None
+    return bigqmt_xtdata.to_yyyymmdd(idx)
 
 
 def get_last_bar_dates(

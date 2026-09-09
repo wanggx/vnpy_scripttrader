@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -99,3 +100,39 @@ def instrument_name(detail: dict[str, Any] | None) -> str:
     return str(
         detail.get("InstrumentName") or detail.get("instrument_name") or ""
     ).strip()
+
+
+def to_yyyymmdd(value: Any) -> str | None:
+    """把交易日/K 线时间规范成 YYYYMMDD。
+
+    MiniQMT ``get_trading_dates`` 多为毫秒时间戳；BigQMT / ContextInfo 常直接
+    返回 ``YYYYMMDD`` 或带 ``-`` 的日期字符串。
+    """
+    if value is None:
+        return None
+    if hasattr(value, "strftime"):
+        return str(value.strftime("%Y%m%d"))
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        # 秒级约 1e9，毫秒约 1e12；小于 1e11 当秒处理。
+        if ts >= 1e11:
+            ts /= 1000.0
+        return datetime.fromtimestamp(ts).strftime("%Y%m%d")
+    text = str(value).strip().replace("-", "").replace("/", "").replace(" ", "")
+    if len(text) >= 8 and text[:8].isdigit():
+        return text[:8]
+    if text.isdigit():
+        return to_yyyymmdd(int(text))
+    return None
+
+
+def trading_dates_to_yyyymmdd(raw_dates: Any) -> list[str]:
+    """规范化 ``get_trading_dates`` 返回值为 YYYYMMDD 列表。"""
+    if not raw_dates:
+        return []
+    result: list[str] = []
+    for item in raw_dates:
+        day = to_yyyymmdd(item)
+        if day:
+            result.append(day)
+    return result
