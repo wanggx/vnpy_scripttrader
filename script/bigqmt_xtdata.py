@@ -9,9 +9,8 @@
 3. 与本文件同目录的 ``bigqmt_signal_trader_client_config.py`` 存在且设置了
    ``BIGQMT_ACCOUNT_ID``（可从 ``bigqmt_signal_trader_client_config.example.py`` 复制）。
 
-历史 K 线读的是大 QMT 终端本地库；缺周期请在终端「数据管理」补。
-选股默认禁止 ``download_history_data2``（全市场下载易拖垮终端），见
-``ENABLE_DOWNLOAD_TODAY``。
+历史 K 线经 RPC 读大 QMT 终端本地库；选股前会先探本地最后一根日期，
+只对缺当日的标的按小批次 ``download_history_data2``（可用环境变量关闭）。
 """
 
 from __future__ import annotations
@@ -68,12 +67,11 @@ from bigqmt_signal_trader.xtquant_compat import configure, xtdata as _bq_xtdata
 READ_BATCH_SIZE: int = 100
 # 选股全区间读数可能较慢，覆盖默认 30s。
 RPC_TIMEOUT_SECONDS: float = float(os.environ.get("BIGQMT_SELECT_RPC_TIMEOUT", "120"))
-# 选股默认禁止 download_history_data2：一次塞入全市场会拖垮大 QMT 终端。
-# 需要时在「数据管理」补日线，或设环境变量 BIGQMT_ENABLE_DOWNLOAD_TODAY=1。
+# 探完本地覆盖后，对「缺当日」的标的是否分批 download（禁止一次丢全市场）。
 ENABLE_DOWNLOAD_TODAY: bool = os.environ.get(
-    "BIGQMT_ENABLE_DOWNLOAD_TODAY", ""
-).strip().lower() in {"1", "true", "yes", "on"}
-# 若强制开启当日下载，每批标的数（仍可能压垮终端，慎用）。
+    "BIGQMT_ENABLE_DOWNLOAD_TODAY", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+# 当日补数每批标的数；过大仍可能压垮大 QMT。
 DOWNLOAD_TODAY_BATCH_SIZE: int = int(
     os.environ.get("BIGQMT_DOWNLOAD_TODAY_BATCH", "50")
 )

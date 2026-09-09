@@ -9,9 +9,9 @@
 最高价已腰斩（``close <= 最高价 × HALF_RATIO``），未腰斩的标的在打分前整批剔除。
 
 需大 QMT + xtquant-big-convert RPC 桥运行后经 ScriptTrader 执行（不再依赖 MiniQMT）。
-行情经 ``bigqmt_xtdata`` 读大 QMT 终端本地库；缺历史/当日请在终端「数据管理」补全。
-默认不调 ``download_history_data2``（全市场一次下载会拖垮大 QMT）。前复权下历史价
-会随分红整体位移，故每轮仍读全区间计算均线。
+行情经 ``bigqmt_xtdata`` 读终端本地库。选股前会探各标的本地最后一根日线日期，
+只对缺目标交易日的代码按小批次补数（禁止一次丢全市场）。前复权下历史价会随
+分红整体位移，故每轮仍读全区间计算均线。
 
 默认每个交易日收盘后 16:00 执行一次并长期循环：启动后等待下一个 16:00 才首次
 执行，周末/节假日（非交易日）跳过，单轮失败等下一轮，用户停止则退出调度。
@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 
 import bigqmt_xtdata
+import download_xtquant_daily as xt_daily
 from bigqmt_xtdata import instrument_name, xtdata
 from vnpy_sqlapp import APP_NAME
 
@@ -207,32 +208,52 @@ def _download_today(
     universe: list[tuple[str, str]],
     trade_date: str,
 ) -> bool:
-    """可选：补当日日线。大 QMT 上全市场一次 download 会拖垮终端，默认跳过。
+    """先探终端本地日线覆盖，再仅对缺 ``trade_date`` 的标的分批补数。
 
-    返回是否继续后续读数（用户停止返回 False）。缺当日 bar 请在终端「数据管理」补。
+    不知道本地存了什么就不能盲目跳过或全量下载：用 ``get_market_data_ex(count=1)``
+    看最后一根日期；已覆盖的跳过。缺的才 ``download_history_data2``，且按小批次，
+    禁止一次塞入全市场（会拖垮大 QMT）。下载失败不阻断，后续按实际读到的数据选。
+    用户停止返回 False。
     """
     if not engine.is_active():
-        engine.write_log("当日下载已停止（尚未开始）")
+        engine.write_log("当日数据准备已停止（尚未开始）")
         return False
 
     codes: list[str] = [code for code, _ in universe]
     total: int = len(codes)
+    engine.write_log(f"正在探查终端本地日线覆盖（目标日 {trade_date}，{total} 只）")
+    last_dates: dict[str, str] | None = xt_daily.get_last_bar_dates(
+        engine, codes, trade_date
+    )
+    if last_dates is None:
+        return False
+
+    need: list[str] = [
+        code for code in codes if last_dates.get(code, "") < trade_date
+    ]
+    ready: int = total - len(need)
+    engine.write_log(
+        f"本地日线覆盖 {trade_date}：已有 {ready}/{total}，缺 {len(need)}"
+    )
+    if not need:
+        return True
+
     if not bigqmt_xtdata.ENABLE_DOWNLOAD_TODAY:
         engine.write_log(
-            f"跳过当日 download_history_data2（{trade_date}，{total} 只）："
-            "全量下载易拖垮大 QMT，请用终端「数据管理」补日线后直接读本地库"
+            f"已关闭当日补数（BIGQMT_ENABLE_DOWNLOAD_TODAY=0），"
+            f"将仅用已有本地数据继续（缺 {len(need)} 只）"
         )
         return True
 
     batch_size: int = max(1, bigqmt_xtdata.DOWNLOAD_TODAY_BATCH_SIZE)
     engine.write_log(
-        f"开始分批补当日日线（{trade_date}）：{total} 个标的，每批 {batch_size}"
+        f"开始分批补缺当日日线（{trade_date}）：{len(need)} 只，每批 {batch_size}"
     )
-    for start in range(0, total, batch_size):
+    for start in range(0, len(need), batch_size):
         if not engine.is_active():
-            engine.write_log(f"当日下载已停止：{start}/{total}")
+            engine.write_log(f"当日补数已停止：{start}/{len(need)}")
             return False
-        batch: list[str] = codes[start : start + batch_size]
+        batch: list[str] = need[start : start + batch_size]
         try:
             xtdata.download_history_data2(
                 stock_list=batch,
@@ -243,12 +264,15 @@ def _download_today(
             )
         except Exception as exc:  # noqa: BLE001
             engine.write_log(
-                f"当日下载批次失败 {start + 1}-{start + len(batch)}/{total}：{exc}；"
-                "改用终端已有数据"
+                f"当日补数批次失败 {start + 1}-{start + len(batch)}/{len(need)}：{exc}；"
+                "改用当前本地已有数据继续"
             )
             return True
-        engine.write_log(f"当日下载进度：{min(start + len(batch), total)}/{total}")
-    engine.write_log(f"当日日线下载完成：{total} 个标的")
+        engine.write_log(
+            f"当日补数进度：{min(start + len(batch), len(need))}/{len(need)}"
+        )
+
+    engine.write_log(f"当日缺数补数请求已发完：{len(need)} 只（以随后全量读取为准）")
     return True
 
 
@@ -260,12 +284,10 @@ def _load_bar_series(
 ) -> dict[str, pd.DataFrame] | None:
     """分批读取全池前复权收盘价/最高价，返回 ``{code: DataFrame}``。
 
-    用户停止时返回 None。默认不调 ``download_history_data2``（全市场下载会拖垮
-    大 QMT），直接 ``get_market_data_ex`` 读终端本地库；缺当日请在「数据管理」补。
-    前复权下每次新分红会整体位移历史价，均线需重读全段。``fill_data=False`` 让
-    停牌留 NaN，``dropna`` 后的长度才是真实交易日数。同时读 ``high`` 用于腰斩判断。
+    用户停止时返回 None。先探本地覆盖并只对缺目标日的标的分批补数，再
+    ``get_market_data_ex`` 读全区间。前复权下每次新分红会整体位移历史价，均线需
+    重读全段。``fill_data=False`` 让停牌留 NaN。同时读 ``high`` 用于腰斩判断。
     """
-    # 可选补当日；默认跳过，见 bigqmt_xtdata.ENABLE_DOWNLOAD_TODAY。
     if not _download_today(engine, universe, end_time):
         return None
 

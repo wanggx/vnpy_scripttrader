@@ -4,11 +4,9 @@
 区别只在标的池：本脚本跑全部沪深京 A 股，结果以 ``sector_name=沪深京A股``
 写入同一张 ``stock_near_ma``（与申万板块结果互不覆盖）。
 
-经 BigQMT RPC（``bigqmt_xtdata``）读大 QMT 终端本地库，不再依赖 MiniQMT。
-默认不调 ``download_history_data2``（全市场下载易拖垮终端）；缺历史/当日请在
-终端「数据管理」补。读行情按 ``READ_BATCH_SIZE`` 分批以适配 RPC 超时。
-
-调度与行业版相同：每个交易日 16:00 执行，启动后等下一个 16:00，非交易日跳过。
+经 BigQMT RPC（``bigqmt_xtdata``）读终端本地库。选股前探本地最后一根日期，
+只对缺目标日的标的小批次补数（禁止一次丢全市场）。读行情按 ``READ_BATCH_SIZE``
+分批。调度与行业版相同：每个交易日 16:00 执行，启动后等下一个 16:00，非交易日跳过。
 """
 
 # pylint: disable=protected-access
@@ -95,7 +93,7 @@ def _load_bar_series(
     start_time: str,
     end_time: str,
 ) -> dict[str, pd.DataFrame] | None:
-    """默认跳过当日 download，分批读全区间前复权 close/high（见 ma._download_today）。"""
+    """默认先探本地覆盖并只补缺数，再分批读全区间前复权 close/high。"""
     if not ma._download_today(engine, universe, end_time):
         return None
 
