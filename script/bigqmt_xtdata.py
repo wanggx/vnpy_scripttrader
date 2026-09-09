@@ -9,8 +9,8 @@
 3. 与本文件同目录的 ``bigqmt_signal_trader_client_config.py`` 存在且设置了
    ``BIGQMT_ACCOUNT_ID``（可从 ``bigqmt_signal_trader_client_config.example.py`` 复制）。
 
-历史 K 线经 RPC 读大 QMT 终端本地库；选股前会先探本地最后一根日期，
-只对缺当日的标的按小批次 ``download_history_data2`` 补数。
+历史 K 线经 RPC 读大 QMT 终端本地库；选股一次分批读全区间，仅对缺目标日的
+标的小批次补数并重读这些代码。
 """
 
 from __future__ import annotations

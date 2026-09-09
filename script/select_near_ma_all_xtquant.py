@@ -134,7 +134,6 @@ def _run_once(engine: ScriptEngine) -> None:
     start_min: str = min(window_start.values())
     engine.write_log(f"交易日历 {len(calendar)} 个，均线窗口起点：{window_start}")
 
-    engine.write_log(f"开始读取前复权行情（{start_min} 至 {end_date}）")
     series_map: dict[str, pd.DataFrame] | None = ma._load_bar_series(
         engine, universe, start_min, end_date
     )
