@@ -10,7 +10,7 @@
    ``BIGQMT_ACCOUNT_ID``（可从 ``bigqmt_signal_trader_client_config.example.py`` 复制）。
 
 历史 K 线经 RPC 读大 QMT 终端本地库；选股前会先探本地最后一根日期，
-只对缺当日的标的按小批次 ``download_history_data2``（可用环境变量关闭）。
+只对缺当日的标的按小批次 ``download_history_data2`` 补数。
 """
 
 from __future__ import annotations
