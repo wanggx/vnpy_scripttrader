@@ -9,8 +9,8 @@
 最高价已腰斩（``close <= 最高价 × HALF_RATIO``），未腰斩的标的在打分前整批剔除。
 
 需大 QMT + xtquant-big-convert RPC 桥运行后经 ScriptTrader 执行（不再依赖 MiniQMT）。
-行情经 ``bigqmt_xtdata`` 读大 QMT 终端本地库；缺历史请在终端「数据管理」补全，
-``download_history_data2`` 在大 QMT 上常不可用，本脚本仅尽力补当日。前复权下历史价
+行情经 ``bigqmt_xtdata`` 读大 QMT 终端本地库；缺历史/当日请在终端「数据管理」补全。
+默认不调 ``download_history_data2``（全市场一次下载会拖垮大 QMT）。前复权下历史价
 会随分红整体位移，故每轮仍读全区间计算均线。
 
 默认每个交易日收盘后 16:00 执行一次并长期循环：启动后等待下一个 16:00 才首次
@@ -207,11 +207,9 @@ def _download_today(
     universe: list[tuple[str, str]],
     trade_date: str,
 ) -> bool:
-    """尽力补当日日线（大 QMT 上 download 常不可用，失败不阻断读数）。
+    """可选：补当日日线。大 QMT 上全市场一次 download 会拖垮终端，默认跳过。
 
-    BigQMT 的 ``get_market_data_ex`` 读的是交易端本地库；若终端已在「数据管理」
-    补过日线，即使本函数失败仍可继续选股。一次传入全部代码，避免分批 RPC 打挂。
-    返回是否完整执行（用户停止返回 False）。
+    返回是否继续后续读数（用户停止返回 False）。缺当日 bar 请在终端「数据管理」补。
     """
     if not engine.is_active():
         engine.write_log("当日下载已停止（尚未开始）")
@@ -219,36 +217,38 @@ def _download_today(
 
     codes: list[str] = [code for code, _ in universe]
     total: int = len(codes)
-    engine.write_log(
-        f"开始尽力补当日日线（{trade_date}）：{total} 个标的（大 QMT 上可能不可用）"
-    )
-    last_logged: list[int] = [0]
-
-    def on_progress(data: dict[str, Any]) -> None:
-        finished: int = int(data.get("finished") or data.get("done") or 0)
-        total_n: int = int(data.get("total") or total)
-        if (
-            finished == 1
-            or finished >= total_n
-            or finished - last_logged[0] >= 200
-        ):
-            last_logged[0] = finished
-            msg: str = str(data.get("message", "")).strip()
-            extra: str = f"，{msg}" if msg else ""
-            engine.write_log(f"当日下载进度：{finished}/{total_n}{extra}")
-
-    try:
-        xtdata.download_history_data2(
-            stock_list=codes,
-            period="1d",
-            start_time=trade_date,
-            end_time=trade_date,
-            callback=on_progress,
-            incrementally=True,
+    if not bigqmt_xtdata.ENABLE_DOWNLOAD_TODAY:
+        engine.write_log(
+            f"跳过当日 download_history_data2（{trade_date}，{total} 只）："
+            "全量下载易拖垮大 QMT，请用终端「数据管理」补日线后直接读本地库"
         )
-        engine.write_log(f"当日日线下载完成：{total} 个标的")
-    except Exception as exc:  # noqa: BLE001 - 大 QMT 下载失败时改读终端已有数据
-        engine.write_log(f"当日日线下载不可用/失败，改用终端已有数据：{exc}")
+        return True
+
+    batch_size: int = max(1, bigqmt_xtdata.DOWNLOAD_TODAY_BATCH_SIZE)
+    engine.write_log(
+        f"开始分批补当日日线（{trade_date}）：{total} 个标的，每批 {batch_size}"
+    )
+    for start in range(0, total, batch_size):
+        if not engine.is_active():
+            engine.write_log(f"当日下载已停止：{start}/{total}")
+            return False
+        batch: list[str] = codes[start : start + batch_size]
+        try:
+            xtdata.download_history_data2(
+                stock_list=batch,
+                period="1d",
+                start_time=trade_date,
+                end_time=trade_date,
+                incrementally=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            engine.write_log(
+                f"当日下载批次失败 {start + 1}-{start + len(batch)}/{total}：{exc}；"
+                "改用终端已有数据"
+            )
+            return True
+        engine.write_log(f"当日下载进度：{min(start + len(batch), total)}/{total}")
+    engine.write_log(f"当日日线下载完成：{total} 个标的")
     return True
 
 
@@ -260,12 +260,12 @@ def _load_bar_series(
 ) -> dict[str, pd.DataFrame] | None:
     """分批读取全池前复权收盘价/最高价，返回 ``{code: DataFrame}``。
 
-    用户停止时返回 None。先增量下载当日日线（``_download_today``，只补当天），
-    再用 ``get_market_data_ex`` 读全区间缓存（前复权下每次新分红会整体位移
-    历史价，均线需重读全段，不可只取增量）。``fill_data=False`` 让停牌留 NaN，
-    ``dropna`` 后的长度才是真实交易日数。同时读 ``high`` 用于腰斩判断。
+    用户停止时返回 None。默认不调 ``download_history_data2``（全市场下载会拖垮
+    大 QMT），直接 ``get_market_data_ex`` 读终端本地库；缺当日请在「数据管理」补。
+    前复权下每次新分红会整体位移历史价，均线需重读全段。``fill_data=False`` 让
+    停牌留 NaN，``dropna`` 后的长度才是真实交易日数。同时读 ``high`` 用于腰斩判断。
     """
-    # 当日新 bar 不在缓存里时 get_market_data_ex 取不到，先增量补当天。
+    # 可选补当日；默认跳过，见 bigqmt_xtdata.ENABLE_DOWNLOAD_TODAY。
     if not _download_today(engine, universe, end_time):
         return None
 

@@ -5,8 +5,8 @@
 写入同一张 ``stock_near_ma``（与申万板块结果互不覆盖）。
 
 经 BigQMT RPC（``bigqmt_xtdata``）读大 QMT 终端本地库，不再依赖 MiniQMT。
-当日下载尽力而为（大 QMT 上常不可用）；缺历史请在终端「数据管理」补。
-读行情按 ``READ_BATCH_SIZE`` 分批以适配 RPC 超时。
+默认不调 ``download_history_data2``（全市场下载易拖垮终端）；缺历史/当日请在
+终端「数据管理」补。读行情按 ``READ_BATCH_SIZE`` 分批以适配 RPC 超时。
 
 调度与行业版相同：每个交易日 16:00 执行，启动后等下一个 16:00，非交易日跳过。
 """
@@ -40,8 +40,6 @@ SECTOR_NAME: str = PRIMARY_SECTOR
 # BigQMT 无 get_instrument_detail_list，名称仍逐批读；行情批大小与桥对齐。
 NAME_BATCH_SIZE: int = 50
 READ_BATCH_SIZE: int = bigqmt_xtdata.READ_BATCH_SIZE
-# 下载进度日志间隔（callback.finished）。
-DOWNLOAD_LOG_EVERY: int = 200
 
 
 def _get_all_stock_codes(engine: ScriptEngine) -> list[str]:
@@ -91,59 +89,14 @@ def _filter_universe(
     return kept
 
 
-def _download_today(
-    engine: ScriptEngine,
-    universe: list[tuple[str, str]],
-    trade_date: str,
-) -> bool:
-    """尽力补当日日线；大 QMT 下载失败不阻断，改读终端已有数据。"""
-    if not engine.is_active():
-        engine.write_log("当日下载已停止（尚未开始）")
-        return False
-
-    codes: list[str] = [code for code, _ in universe]
-    total: int = len(codes)
-    engine.write_log(
-        f"开始尽力补当日日线（{trade_date}）：{total} 个标的（大 QMT 上可能不可用）"
-    )
-    last_logged: list[int] = [0]
-
-    def on_progress(data: dict[str, Any]) -> None:
-        finished: int = int(data.get("finished") or data.get("done") or 0)
-        total_n: int = int(data.get("total") or total)
-        if (
-            finished == 1
-            or finished >= total_n
-            or finished - last_logged[0] >= DOWNLOAD_LOG_EVERY
-        ):
-            last_logged[0] = finished
-            msg: str = str(data.get("message", "")).strip()
-            extra: str = f"，{msg}" if msg else ""
-            engine.write_log(f"当日下载进度：{finished}/{total_n}{extra}")
-
-    try:
-        xtdata.download_history_data2(
-            stock_list=codes,
-            period="1d",
-            start_time=trade_date,
-            end_time=trade_date,
-            callback=on_progress,
-            incrementally=True,
-        )
-        engine.write_log(f"当日日线下载完成：{total} 个标的")
-    except Exception as exc:  # noqa: BLE001
-        engine.write_log(f"当日日线下载不可用/失败，改用终端已有数据：{exc}")
-    return True
-
-
 def _load_bar_series(
     engine: ScriptEngine,
     universe: list[tuple[str, str]],
     start_time: str,
     end_time: str,
 ) -> dict[str, pd.DataFrame] | None:
-    """先尽力补当日，再分批读全区间前复权 close/high。"""
-    if not _download_today(engine, universe, end_time):
+    """默认跳过当日 download，分批读全区间前复权 close/high（见 ma._download_today）。"""
+    if not ma._download_today(engine, universe, end_time):
         return None
 
     codes: list[str] = [code for code, _ in universe]
