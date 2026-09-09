@@ -4,9 +4,9 @@
 区别只在标的池：本脚本跑全部沪深京 A 股，结果以 ``sector_name=沪深京A股``
 写入同一张 ``stock_near_ma``（与申万板块结果互不覆盖）。
 
-经 BigQMT RPC（``bigqmt_xtdata``）读终端本地库。选股前探本地最后一根日期，
-只对缺目标日的标的小批次补数（禁止一次丢全市场）。读行情按 ``READ_BATCH_SIZE``
-分批。调度与行业版相同：每个交易日 16:00 执行，启动后等下一个 16:00，非交易日跳过。
+经 BigQMT RPC（``bigqmt_xtdata``）读终端本地库。行情读取/补数复用
+``select_near_ma_xtquant._load_bar_series``。调度与行业版相同：每个交易日 16:00
+执行，启动后等下一个 16:00，非交易日跳过。
 """
 
 # pylint: disable=protected-access
@@ -35,9 +35,8 @@ PRIMARY_SECTOR: str = "沪深京A股"
 FALLBACK_SECTORS: tuple[str, ...] = ("沪深A股", "京市A股")
 # 入库时的 sector_name，与申万行业版共用表、靠主键区分。
 SECTOR_NAME: str = PRIMARY_SECTOR
-# BigQMT 无 get_instrument_detail_list，名称仍逐批读；行情批大小与桥对齐。
+# BigQMT 无 get_instrument_detail_list，名称仍逐批读。
 NAME_BATCH_SIZE: int = 50
-READ_BATCH_SIZE: int = bigqmt_xtdata.READ_BATCH_SIZE
 
 
 def _get_all_stock_codes(engine: ScriptEngine) -> list[str]:
@@ -85,56 +84,6 @@ def _filter_universe(
         engine.write_log(f"筛选进度：{min(start + len(batch), total)}/{total}")
 
     return kept
-
-
-def _load_bar_series(
-    engine: ScriptEngine,
-    universe: list[tuple[str, str]],
-    start_time: str,
-    end_time: str,
-) -> dict[str, pd.DataFrame] | None:
-    """默认先探本地覆盖并只补缺数，再分批读全区间前复权 close/high。"""
-    if not ma._download_today(engine, universe, end_time):
-        return None
-
-    codes: list[str] = [code for code, _ in universe]
-    result: dict[str, pd.DataFrame] = {}
-    total: int = len(codes)
-    logged_sample: bool = False
-
-    for start in range(0, total, READ_BATCH_SIZE):
-        if not engine.is_active():
-            engine.write_log(f"读取已停止：已补充约 {start}/{total} 个标的")
-            return None
-
-        batch: list[str] = codes[start : start + READ_BATCH_SIZE]
-        data: dict[str, pd.DataFrame] = xtdata.get_market_data_ex(
-            field_list=["close", "high"],
-            stock_list=batch,
-            period="1d",
-            start_time=start_time,
-            end_time=end_time,
-            count=-1,
-            dividend_type=ma.DIVIDEND_TYPE,
-            fill_data=False,
-        )
-        for code, df in data.items():
-            if df is None or len(df) == 0:
-                continue
-            result[code] = ma._normalize_bars(df)
-
-        if not logged_sample:
-            sample_code: str | None = next((c for c in batch if c in data), None)
-            if sample_code is not None:
-                sidx = data[sample_code].index
-                engine.write_log(
-                    f"样本 {sample_code} index dtype={sidx.dtype}, 前3={list(sidx[:3])}"
-                )
-                logged_sample = True
-
-        engine.write_log(f"读取行情进度：{min(start + len(batch), total)}/{total}")
-
-    return result
 
 
 def _run_once(engine: ScriptEngine) -> None:
@@ -186,7 +135,7 @@ def _run_once(engine: ScriptEngine) -> None:
     engine.write_log(f"交易日历 {len(calendar)} 个，均线窗口起点：{window_start}")
 
     engine.write_log(f"开始读取前复权行情（{start_min} 至 {end_date}）")
-    series_map: dict[str, pd.DataFrame] | None = _load_bar_series(
+    series_map: dict[str, pd.DataFrame] | None = ma._load_bar_series(
         engine, universe, start_min, end_date
     )
     if series_map is None:
