@@ -238,13 +238,6 @@ def _download_today(
     if not need:
         return True
 
-    if not bigqmt_xtdata.ENABLE_DOWNLOAD_TODAY:
-        engine.write_log(
-            f"已关闭当日补数（BIGQMT_ENABLE_DOWNLOAD_TODAY=0），"
-            f"将仅用已有本地数据继续（缺 {len(need)} 只）"
-        )
-        return True
-
     batch_size: int = max(1, bigqmt_xtdata.DOWNLOAD_TODAY_BATCH_SIZE)
     engine.write_log(
         f"开始分批补缺当日日线（{trade_date}）：{len(need)} 只，每批 {batch_size}"

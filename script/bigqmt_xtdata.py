@@ -67,11 +67,7 @@ from bigqmt_signal_trader.xtquant_compat import configure, xtdata as _bq_xtdata
 READ_BATCH_SIZE: int = 100
 # 选股全区间读数可能较慢，覆盖默认 30s。
 RPC_TIMEOUT_SECONDS: float = float(os.environ.get("BIGQMT_SELECT_RPC_TIMEOUT", "120"))
-# 探完本地覆盖后，对「缺当日」的标的是否分批 download（禁止一次丢全市场）。
-ENABLE_DOWNLOAD_TODAY: bool = os.environ.get(
-    "BIGQMT_ENABLE_DOWNLOAD_TODAY", "1"
-).strip().lower() not in {"0", "false", "no", "off"}
-# 当日补数每批标的数；过大仍可能压垮大 QMT。
+# 当日缺数补下每批标的数；过大仍可能压垮大 QMT。
 DOWNLOAD_TODAY_BATCH_SIZE: int = int(
     os.environ.get("BIGQMT_DOWNLOAD_TODAY_BATCH", "50")
 )
