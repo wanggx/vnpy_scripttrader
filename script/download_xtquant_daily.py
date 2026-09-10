@@ -6,7 +6,8 @@ VeighNa 数据库；大 QMT 上 ``download_history_data2`` 常不可用，失败
 
 策略：
 1. 按标的 ``get_market_data_ex(count=1)`` 看本地最后一根，已覆盖最新交易日的跳过；
-2. 缺的一次传入，``incrementally=True`` 拉 ``start_date→今天``；
+2. 缺的分批（``DOWNLOAD_TODAY_BATCH_SIZE``）传入，``incrementally=True`` 拉
+   ``start_date→今天``；一次性回填传 ``force_full=True`` 跳过第 1 步；
 3. 全区间失败再按自然年切刀重试。
 """
 
@@ -25,7 +26,6 @@ FALLBACK_SECTORS: tuple[str, ...] = ("沪深A股", "京市A股")
 START_DATE: str = "20220427"
 READ_BATCH_SIZE: int = bigqmt_xtdata.READ_BATCH_SIZE
 DIVIDEND_TYPE: str = "front"
-DOWNLOAD_LOG_EVERY: int = 200
 REFRESH_SECTOR_DATA: bool = True
 VALID_MARKETS: tuple[str, ...] = (".SH", ".SZ", ".BJ")
 
@@ -133,44 +133,62 @@ def download_history(
     end_time: str,
     label: str,
 ) -> bool:
-    """一次传入全部代码下载区间日线。大 QMT 上可能直接失败。"""
+    """分批下载区间日线，禁止一次塞入全市场。
+
+    按 ``DOWNLOAD_TODAY_BATCH_SIZE`` 切批，每批 ``download_history_data2(
+    incrementally=True)`` 只补缺口、不重复下已存在数据。单批失败记日志、
+    跳过该批继续。用户停止返回 False。与 ``select_near_ma_xtquant`` 当日
+    补数的分批口径一致。
+    """
     if not engine.is_active():
         engine.write_log(f"{label}已停止（尚未开始）")
         return False
 
     total: int = len(stock_codes)
+    batch_size: int = max(1, bigqmt_xtdata.DOWNLOAD_TODAY_BATCH_SIZE)
     engine.write_log(
-        f"{label}：{total} 个标的，{start_time} 至 {end_time}，一次全量 incrementally"
+        f"{label}：{total} 个标的，{start_time} 至 {end_time}，"
+        f"分批 incrementally（每批 {batch_size}）"
     )
-    last_logged: list[int] = [0]
 
-    def on_progress(data: dict[str, Any]) -> None:
-        finished: int = int(data.get("finished") or data.get("done") or 0)
-        total_n: int = int(data.get("total") or total)
-        if (
-            finished == 1
-            or finished >= total_n
-            or finished - last_logged[0] >= DOWNLOAD_LOG_EVERY
-        ):
-            last_logged[0] = finished
-            msg: str = str(data.get("message", "")).strip()
-            extra: str = f"，{msg}" if msg else ""
-            engine.write_log(f"{label}进度：{finished}/{total_n}{extra}")
+    for start in range(0, total, batch_size):
+        if not engine.is_active():
+            engine.write_log(f"{label}已停止：{start}/{total}")
+            return False
+        batch: list[str] = stock_codes[start : start + batch_size]
+        try:
+            xtdata.download_history_data2(
+                stock_list=batch,
+                period="1d",
+                start_time=start_time,
+                end_time=end_time,
+                incrementally=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - 单批失败跳过，不阻断
+            engine.write_log(
+                f"{label}批次失败 {start + 1}-{start + len(batch)}/{total}：{exc}"
+            )
+            continue
+        engine.write_log(
+            f"{label}进度：{min(start + len(batch), total)}/{total}"
+        )
 
-    xtdata.download_history_data2(
-        stock_list=stock_codes,
-        period="1d",
-        start_time=start_time,
-        end_time=end_time,
-        callback=on_progress,
-        incrementally=True,
-    )
     engine.write_log(f"{label}完成")
     return True
 
 
-def run(engine: "ScriptEngine", start_date: str = START_DATE) -> None:
-    """ScriptTrader 策略入口。"""
+def run(
+    engine: "ScriptEngine",
+    start_date: str = START_DATE,
+    force_full: bool = False,
+) -> None:
+    """ScriptTrader 策略入口。
+
+    force_full=True 时跳过「最新交易日是否已覆盖」的过滤，直接对全部标的
+    按 ``[start_date, 今天]`` 下载（``incrementally=True`` 只补缺口、不重复
+    下载已存在数据）。一次性历史回填应传 True：否则只要某标的偶然有过最新
+    一根，就会被判为「已完整」而漏掉更早的历史缺口。
+    """
     if not bigqmt_xtdata.ping(engine):
         engine.write_log("大 QMT RPC 不可用，下载结束")
         return
@@ -190,28 +208,35 @@ def run(engine: "ScriptEngine", start_date: str = START_DATE) -> None:
         )
     latest: str = trading_dates[-1]
 
-    engine.write_log(
-        f"开始检查 {start_date} 至 {end_date} 的日线数据，"
-        f"共 {len(trading_dates)} 个交易日、{len(stock_codes)} 个标的，"
-        f"最新交易日 {latest}"
-    )
+    if force_full:
+        need_codes: list[str] = stock_codes
+        engine.write_log(
+            f"force_full：跳过本地最新根检查，直接对全部 {len(need_codes)} 个标的"
+            f"按 {start_date} 至 {end_date} 补缺口（最新交易日 {latest}）"
+        )
+    else:
+        engine.write_log(
+            f"开始检查 {start_date} 至 {end_date} 的日线数据，"
+            f"共 {len(trading_dates)} 个交易日、{len(stock_codes)} 个标的，"
+            f"最新交易日 {latest}"
+        )
 
-    last_dates: dict[str, str] | None = get_last_bar_dates(
-        engine, stock_codes, end_date
-    )
-    if last_dates is None:
-        return
+        last_dates: dict[str, str] | None = get_last_bar_dates(
+            engine, stock_codes, end_date
+        )
+        if last_dates is None:
+            return
 
-    need_codes: list[str] = [
-        code for code in stock_codes if last_dates.get(code, "") < latest
-    ]
-    complete: int = len(stock_codes) - len(need_codes)
-    engine.write_log(
-        f"本地已覆盖最新交易日 {complete} 个，需补齐 {len(need_codes)} 个"
-    )
-    if not need_codes:
-        engine.write_log("本地日线已完整，无需下载")
-        return
+        need_codes = [
+            code for code in stock_codes if last_dates.get(code, "") < latest
+        ]
+        complete: int = len(stock_codes) - len(need_codes)
+        engine.write_log(
+            f"本地已覆盖最新交易日 {complete} 个，需补齐 {len(need_codes)} 个"
+        )
+        if not need_codes:
+            engine.write_log("本地日线已完整，无需下载")
+            return
 
     try:
         if download_history(

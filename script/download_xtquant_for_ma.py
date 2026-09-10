@@ -20,5 +20,9 @@ START_DATE: str = min(select_near_ma_xtquant.FIXED_DATES)
 
 
 def run(engine: "ScriptEngine") -> None:
-    """ScriptTrader 策略入口：从 START_DATE 起补全全市场日线。"""
-    download_xtquant_daily.run(engine, start_date=START_DATE)
+    """ScriptTrader 策略入口：从 START_DATE 起补全全市场日线。
+
+    一次性历史回填，传 force_full=True 跳过「最新根已存在即跳过」的增量
+    判定，否则偶然下过最新一天的标的会被漏掉更早的历史缺口。
+    """
+    download_xtquant_daily.run(engine, start_date=START_DATE, force_full=True)
