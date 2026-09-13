@@ -3,7 +3,7 @@
 对每个标的，分别计算从固定日期到最新交易日 T 的前复权收盘价均值作为一条均线，
 判断当天收盘价是否在 ``NEAR_THRESHOLD`` 内接近这些均线，按"接近越多 + 时间越久
 (天数越大)权重越大"打分 0-100，选前 ``TOP_N`` 存入 SqlApp 数据库。结果保留"接近
-的均线有哪几根 + 每根天数"，按日期保存、仅保留最近 ``RETENTION_DAYS`` 天。
+的均线有哪几根 + 每根天数"，按日期保存，历史数据全部保留、不做清理。
 
 开 ``REQUIRE_HALVED`` 时，额外要求 T 日收盘价相对近 ``HIGH_LOOKBACK`` 个交易日
 最高价已腰斩（``close <= 最高价 × HALF_RATIO``），未腰斩的标的在打分前整批剔除。
@@ -52,8 +52,6 @@ BREAK_LOOKBACK: int = 20
 BREAK_THRESHOLD: float = 0.03
 # 选前 N 个标的入库。
 TOP_N: int = 100
-# 仅保留最近 N 天的数据。
-RETENTION_DAYS: int = 7
 # 单条均线窗口内有效交易日点少于此值则该均线无效（不进分子也不进分母）。
 MIN_WINDOW_POINTS: int = 5
 # 复权方式：front=前复权 / back=后复权 / none=不复权。
@@ -498,7 +496,7 @@ def _save_results(
     results: list[dict[str, Any]],
     engine: ScriptEngine,
 ) -> None:
-    """建表、幂等写入当日结果、清理超过 RETENTION_DAYS 的旧数据。"""
+    """建表、幂等写入当日结果（只覆盖同交易日同板块的旧行，不清理历史）。"""
     ph: str = "?" if driver == "sqlite" else "%s"
 
     ddl: str = (
@@ -549,13 +547,6 @@ def _save_results(
             conn.executemany(insert, rows)
     engine.write_log(
         f"板块“{sector_name}”已写入 {len(rows)} 行（trade_date={trade_date}）"
-    )
-
-    cutoff: str = (datetime.now() - timedelta(days=RETENTION_DAYS)).strftime("%Y%m%d")
-    cleanup: str = f"DELETE FROM {TABLE_NAME} WHERE trade_date < {ph}"
-    deleted: int = sql_engine.execute(cleanup, (cutoff,))
-    engine.write_log(
-        f"清理 {RETENTION_DAYS} 天前数据：删除 {deleted} 行（cutoff={cutoff}）"
     )
 
 

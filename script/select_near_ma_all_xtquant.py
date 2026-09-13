@@ -6,7 +6,7 @@
 
 经 BigQMT RPC（``bigqmt_xtdata``）读终端本地库。行情读取/补数复用
 ``select_near_ma_xtquant._load_bar_series``。调度与行业版相同：每个交易日 16:00
-执行，启动后等下一个 16:00，非交易日跳过。
+执行，启动后等下一个 16:00，非交易日跳过。结果按日累积，不清理历史数据。
 """
 
 # pylint: disable=protected-access
