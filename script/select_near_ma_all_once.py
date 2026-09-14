@@ -1,6 +1,6 @@
 """全市场成本均线选股：启动后立刻跑一轮，跑完结束。
 
-逻辑与 ``select_near_ma_all_xtquant.py`` 完全相同（沪深京A股、打分、入库），
+逻辑与 ``select_near_ma_all_xtquant.py`` 完全相同（沪深A股、打分、入库），
 只是不做 16:00 调度循环。适合手动验证或临时补跑当天结果。
 
 日常定时请用 ``select_near_ma_all_xtquant.py``。

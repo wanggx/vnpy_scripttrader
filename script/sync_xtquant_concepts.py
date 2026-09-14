@@ -18,6 +18,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from a_share import PRIMARY_SECTOR as A_SHARE_SECTOR
+from a_share import VALID_MARKETS
 from xtquant import xtdata
 from vnpy_sqlapp import APP_NAME
 
@@ -47,9 +49,6 @@ EXCLUDED_SECTOR_SUFFIXES: tuple[str, ...] = ("加权",)
 # 这类过期概念的成分代码大半已退市，经 A 股池过滤后通常只剩寥寥几个。设此阈值
 # 可砍掉历史长尾。设为 1 则不过滤（仅剔除成分为空的概念）。首轮先看直方图再调。
 MIN_MEMBER_COUNT: int = 5
-
-# 只保存当前仍属于沪深京 A 股池的成分，退市及其他市场标的不会落库。
-A_SHARE_SECTOR: str = "沪深京A股"
 
 # 控制进度日志频率，不影响抓取或写库批次。
 PROGRESS_INTERVAL: int = 100
@@ -270,7 +269,7 @@ def _collect_snapshot(
     active_codes: set[str] = {
         str(code).strip()
         for code in (xtdata.get_stock_list_in_sector(A_SHARE_SECTOR) or [])
-        if str(code).strip()
+        if str(code).strip() and str(code).endswith(VALID_MARKETS)
     }
     if not active_codes:
         raise RuntimeError(

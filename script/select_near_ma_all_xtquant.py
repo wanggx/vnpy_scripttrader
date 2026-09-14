@@ -1,8 +1,8 @@
-"""全市场 A 股成本均线选股（沪深京A股，约 5000+ 标的）。
+"""全市场 A 股成本均线选股（沪深A股，约 5000+ 标的）。
 
 打分规则、均线日期、腰斩过滤、入库表与 ``select_near_ma_xtquant.py`` 相同，
-区别只在标的池：本脚本跑全部沪深京 A 股，结果以 ``sector_name=沪深京A股``
-写入同一张 ``stock_near_ma``（与申万板块结果互不覆盖）。
+区别只在标的池：本脚本跑全部沪深 A 股（过滤北交所），结果以
+``sector_name=沪深A股`` 写入同一张 ``stock_near_ma``（与申万板块结果互不覆盖）。
 
 经 BigQMT RPC（``bigqmt_xtdata``）读终端本地库。行情读取/补数复用
 ``select_near_ma_xtquant._load_bar_series``。调度与行业版相同：每个交易日 16:00
@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import bigqmt_xtdata
+from a_share import FALLBACK_SECTORS, PRIMARY_SECTOR, VALID_MARKETS
 from bigqmt_xtdata import instrument_name, xtdata
 
 # 复用行业版的打分/落库/调度，避免两套规则漂移。
@@ -30,9 +31,6 @@ if TYPE_CHECKING:
     from vnpy_sqlapp import SqlEngine
 
 
-# 与 download_xtquant_daily.py 一致：新版板块名，旧版回退。
-PRIMARY_SECTOR: str = "沪深京A股"
-FALLBACK_SECTORS: tuple[str, ...] = ("沪深A股", "京市A股")
 # 入库时的 sector_name，与申万行业版共用表、靠主键区分。
 SECTOR_NAME: str = PRIMARY_SECTOR
 # BigQMT 无 get_instrument_detail_list，名称仍逐批读。
@@ -40,7 +38,7 @@ NAME_BATCH_SIZE: int = 50
 
 
 def _get_all_stock_codes(engine: ScriptEngine) -> list[str]:
-    """获取当前沪深京 A 股代码，兼容旧版板块分类。"""
+    """获取当前沪深 A 股代码（过滤北交所），兼容旧版板块分类。"""
     stock_codes: list[str] = xtdata.get_stock_list_in_sector(PRIMARY_SECTOR) or []
     if not stock_codes:
         engine.write_log(
@@ -50,7 +48,7 @@ def _get_all_stock_codes(engine: ScriptEngine) -> list[str]:
             stock_codes.extend(xtdata.get_stock_list_in_sector(sector) or [])
 
     return sorted(
-        {code for code in stock_codes if code.endswith(ma.VALID_MARKETS)}
+        {code for code in stock_codes if code.endswith(VALID_MARKETS)}
     )
 
 
@@ -87,7 +85,7 @@ def _filter_universe(
 
 
 def _run_once(engine: ScriptEngine) -> None:
-    """对沪深京 A 股全市场执行一次选股。"""
+    """对沪深 A 股全市场执行一次选股。"""
     sql_engine: SqlEngine | None = engine.main_engine.get_engine(APP_NAME)
     if sql_engine is None:
         raise RuntimeError(

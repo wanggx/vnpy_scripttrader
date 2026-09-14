@@ -12,6 +12,8 @@ from itertools import product
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from a_share import PRIMARY_SECTOR as A_SHARE_SECTOR
+from a_share import VALID_MARKETS
 from xtquant import xtdata
 from vnpy_sqlapp import APP_NAME
 
@@ -34,9 +36,6 @@ INCLUDED_SECTOR_CATEGORIES: tuple[str, ...] = ("申万行业",)
 
 # 申万板块同时提供普通和“加权”版本，成分关系基本重复，只保留普通版本。
 EXCLUDED_SECTOR_SUFFIXES: tuple[str, ...] = ("加权",)
-
-# 只保存当前仍属于沪深京 A 股池的成分，退市及其他市场标的不会落库。
-A_SHARE_SECTOR: str = "沪深京A股"
 
 # 尚未进入申万分类的新股使用统一占位值，确保当前 A 股仍能保存到关系表。
 UNCLASSIFIED_NAME: str = "未分类"
@@ -166,7 +165,7 @@ def _collect_snapshot(
     active_codes: set[str] = {
         str(code).strip()
         for code in (xtdata.get_stock_list_in_sector(A_SHARE_SECTOR) or [])
-        if str(code).strip()
+        if str(code).strip() and str(code).endswith(VALID_MARKETS)
     }
     if not active_codes:
         raise RuntimeError(

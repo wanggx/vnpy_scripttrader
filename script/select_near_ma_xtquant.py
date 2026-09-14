@@ -30,6 +30,7 @@ import pandas as pd
 
 import bigqmt_xtdata
 import download_xtquant_daily as xt_daily
+from a_share import VALID_MARKETS
 from bigqmt_xtdata import instrument_name, xtdata
 from vnpy_sqlapp import APP_NAME
 
@@ -78,7 +79,6 @@ RUN_MINUTE: int = 0
 # 等待时每步最长睡眠秒数，分段睡眠以快速响应停止操作。
 SLEEP_STEP_SECONDS: int = 60
 
-VALID_MARKETS: tuple[str, ...] = (".SH", ".SZ", ".BJ")
 
 
 def _weight(days: int) -> float:
@@ -168,7 +168,7 @@ def _get_sector_stock_codes(engine: ScriptEngine, sector_name: str) -> list[str]
         engine.write_log(f"xtquant 板块“{sector_name}”不存在或没有当前成分")
         return []
 
-    # 成分可能重复或混入其他市场，仅保留沪深京标的。
+    # 成分可能重复或混入其他市场，仅保留沪深 A 股标的（过滤北交所）。
     return sorted({code for code in stock_codes if code.endswith(VALID_MARKETS)})
 
 

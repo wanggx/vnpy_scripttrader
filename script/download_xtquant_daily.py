@@ -15,23 +15,21 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import bigqmt_xtdata
+from a_share import FALLBACK_SECTORS, PRIMARY_SECTOR, VALID_MARKETS
 from bigqmt_xtdata import xtdata
 
 if TYPE_CHECKING:
     from vnpy_scripttrader.engine import ScriptEngine
 
 
-PRIMARY_SECTOR: str = "沪深京A股"
-FALLBACK_SECTORS: tuple[str, ...] = ("沪深A股", "京市A股")
 START_DATE: str = "20220427"
 READ_BATCH_SIZE: int = bigqmt_xtdata.READ_BATCH_SIZE
 DIVIDEND_TYPE: str = "front"
 REFRESH_SECTOR_DATA: bool = True
-VALID_MARKETS: tuple[str, ...] = (".SH", ".SZ", ".BJ")
 
 
 def get_all_stock_codes(engine: "ScriptEngine") -> list[str]:
-    """获取当前沪深京 A 股代码，并兼容旧版本的板块分类。"""
+    """获取当前沪深 A 股代码（过滤北交所），兼容旧版本板块分类。"""
     if REFRESH_SECTOR_DATA:
         engine.write_log("正在更新大 QMT 板块分类数据")
         try:
