@@ -51,7 +51,6 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 
 import bigqmt_xtdata
-from bigqmt_xtdata import xtdata
 from vnpy_sqlapp import APP_NAME
 
 # 通用模块目录：script/talib（指标计算）、script/market（行情取数 + A 股标的池常量）。
@@ -459,12 +458,7 @@ def _run_once(engine: ScriptEngine, download_missing: bool | None = None) -> Non
         engine.write_log("大 QMT RPC 不可用，本轮结束")
         return
 
-    try:
-        engine.write_log("正在更新大 QMT 板块分类数据")
-        xtdata.download_sector_data()
-    except Exception as exc:  # noqa: BLE001 - 板块更新失败不阻断（成分可能已有）
-        engine.write_log(f"更新板块分类数据失败（继续用已有成分）：{exc}")
-
+    # 板块成分直接读桥接端已有缓存（大 QMT 桥不提供 download_sector_data）。
     stock_codes: list[str] = market_data.get_all_stock_codes(engine)
     if not stock_codes:
         engine.write_log("大 QMT 未返回任何 A 股代码，本轮结束")

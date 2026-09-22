@@ -563,18 +563,13 @@ def _run_once(
         engine.write_log("大 QMT RPC 不可用，本轮结束（请确认终端已加载 BIGQMT 服务端）")
         return
 
+    # 板块成分直接读桥接端已有缓存（大 QMT 桥不提供 download_sector_data）。
     sector_names: list[str] = [
         name.strip() for name in target_sector_name.split(",") if name.strip()
     ]
     if not sector_names:
         engine.write_log("target_sector_name 为空，本轮结束")
         return
-
-    try:
-        engine.write_log("正在更新大 QMT 板块分类数据")
-        xtdata.download_sector_data()
-    except Exception as exc:  # noqa: BLE001 - 失败不阻断，成分可能已可用
-        engine.write_log(f"更新板块分类数据失败（继续用已有成分）：{exc}")
 
     total: int = len(sector_names)
     for index, sector_name in enumerate(sector_names, start=1):

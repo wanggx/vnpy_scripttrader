@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import bigqmt_xtdata
-from bigqmt_xtdata import xtdata
 
 # 复用行业版的打分/落库，避免两套规则漂移。
 import select_near_ma_xtquant as ma
@@ -71,12 +70,7 @@ def _run_once(engine: ScriptEngine) -> None:
         engine.write_log("大 QMT RPC 不可用，本轮结束")
         return
 
-    try:
-        engine.write_log("正在更新大 QMT 板块分类数据")
-        xtdata.download_sector_data()
-    except Exception as exc:  # noqa: BLE001 - 板块更新失败不阻断（成分可能已有）
-        engine.write_log(f"更新板块分类数据失败（继续用已有成分）：{exc}")
-
+    # 板块成分直接读桥接端已有缓存（大 QMT 桥不提供 download_sector_data）。
     stock_codes: list[str] = _get_all_stock_codes(engine)
     if not stock_codes:
         engine.write_log("大 QMT 未返回任何 A 股代码，本轮结束")

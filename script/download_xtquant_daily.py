@@ -33,18 +33,14 @@ if TYPE_CHECKING:
 START_DATE: str = "20220427"
 READ_BATCH_SIZE: int = bigqmt_xtdata.READ_BATCH_SIZE
 DIVIDEND_TYPE: str = "front"
-REFRESH_SECTOR_DATA: bool = True
 
 
 def get_all_stock_codes(engine: "ScriptEngine") -> list[str]:
-    """获取当前沪深 A 股代码（过滤北交所），兼容旧版本板块分类。"""
-    if REFRESH_SECTOR_DATA:
-        engine.write_log("正在更新大 QMT 板块分类数据")
-        try:
-            xtdata.download_sector_data()
-        except Exception as exc:  # noqa: BLE001
-            engine.write_log(f"更新板块分类失败（继续）：{exc}")
+    """获取当前沪深 A 股代码（过滤北交所），兼容旧版本板块分类。
 
+    板块成分直接读桥接端已有缓存：大 QMT 桥不提供 ``download_sector_data``，
+    成分的更新需在 QMT 客户端侧完成。首个板块无成分时按 FALLBACK_SECTORS 回退。
+    """
     stock_codes: list[str] = xtdata.get_stock_list_in_sector(PRIMARY_SECTOR) or []
     if not stock_codes:
         engine.write_log(
