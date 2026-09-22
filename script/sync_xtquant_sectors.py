@@ -8,14 +8,21 @@
 
 from __future__ import annotations
 
+import sys
 from itertools import product
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from a_share import PRIMARY_SECTOR as A_SHARE_SECTOR
-from a_share import VALID_MARKETS
 from xtquant import xtdata
 from vnpy_sqlapp import APP_NAME
+
+# A 股标的池常量在 script/market/ 下（该目录无 __init__.py，直接加入 sys.path 后 import）。
+_MARKET_DIR = Path(__file__).resolve().parent / "market"
+if str(_MARKET_DIR) not in sys.path:
+    sys.path.insert(0, str(_MARKET_DIR))
+
+from a_share import PRIMARY_SECTOR as A_SHARE_SECTOR  # noqa: E402
+from a_share import VALID_MARKETS  # noqa: E402
 
 if TYPE_CHECKING:
     from vnpy_scripttrader.engine import ScriptEngine

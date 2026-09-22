@@ -12,17 +12,26 @@
 # pylint: disable=protected-access
 from __future__ import annotations
 
+import sys
 import traceback
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import bigqmt_xtdata
-from a_share import FALLBACK_SECTORS, PRIMARY_SECTOR, VALID_MARKETS
-from bigqmt_xtdata import instrument_name, xtdata
+from bigqmt_xtdata import xtdata
 
-# 复用行业版的打分/落库/调度，避免两套规则漂移。
+# 复用行业版的打分/落库，避免两套规则漂移。
 import select_near_ma_xtquant as ma
 from vnpy_sqlapp import APP_NAME
+
+# 通用取数/标的池工具与 A 股标的池常量在 script/market/ 下（直接加入 sys.path 后 import）。
+_MARKET_DIR = Path(__file__).resolve().parent / "market"
+if str(_MARKET_DIR) not in sys.path:
+    sys.path.insert(0, str(_MARKET_DIR))
+
+import market_data  # noqa: E402
+from a_share import PRIMARY_SECTOR  # noqa: E402
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -33,55 +42,19 @@ if TYPE_CHECKING:
 
 # 入库时的 sector_name，与申万行业版共用表、靠主键区分。
 SECTOR_NAME: str = PRIMARY_SECTOR
-# BigQMT 无 get_instrument_detail_list，名称仍逐批读。
-NAME_BATCH_SIZE: int = 50
 
 
 def _get_all_stock_codes(engine: ScriptEngine) -> list[str]:
-    """获取当前沪深 A 股代码（过滤北交所），兼容旧版板块分类。"""
-    stock_codes: list[str] = xtdata.get_stock_list_in_sector(PRIMARY_SECTOR) or []
-    if not stock_codes:
-        engine.write_log(
-            f"未找到“{PRIMARY_SECTOR}”板块，回退到：{', '.join(FALLBACK_SECTORS)}"
-        )
-        for sector in FALLBACK_SECTORS:
-            stock_codes.extend(xtdata.get_stock_list_in_sector(sector) or [])
-
-    return sorted(
-        {code for code in stock_codes if code.endswith(VALID_MARKETS)}
-    )
+    """获取当前沪深 A 股代码（过滤北交所，兼容旧版板块分类；委托通用数据层）。"""
+    return market_data.get_all_stock_codes(engine)
 
 
 def _filter_universe(
     engine: ScriptEngine,
     stock_codes: list[str],
 ) -> list[tuple[str, str]] | None:
-    """读合约信息，排除 ST/*ST。BigQMT 无批量 detail 接口，按 NAME_BATCH_SIZE 逐个查。"""
-    engine.write_log(f"正在读取 {len(stock_codes)} 个标的的合约信息（排除ST）")
-    kept: list[tuple[str, str]] = []
-    total: int = len(stock_codes)
-
-    for start in range(0, total, NAME_BATCH_SIZE):
-        if not engine.is_active():
-            engine.write_log(f"筛选已停止：已处理 {start}/{total}")
-            return None
-
-        batch: list[str] = stock_codes[start : start + NAME_BATCH_SIZE]
-        for code in batch:
-            try:
-                detail: dict[str, Any] | None = xtdata.get_instrument_detail(code)
-            except Exception:  # noqa: BLE001 - 单标的失败跳过
-                continue
-            name: str = instrument_name(detail)
-            if not name and not detail:
-                continue
-            if ma.EXCLUDE_ST and "ST" in name.upper():
-                continue
-            kept.append((code, name))
-
-        engine.write_log(f"筛选进度：{min(start + len(batch), total)}/{total}")
-
-    return kept
+    """读合约信息，排除 ST/*ST（委托通用数据层；口径用 ``ma.EXCLUDE_ST``）。"""
+    return market_data.filter_universe(engine, stock_codes, exclude_st=ma.EXCLUDE_ST)
 
 
 def _run_once(engine: ScriptEngine) -> None:
@@ -120,7 +93,7 @@ def _run_once(engine: ScriptEngine) -> None:
     engine.write_log(f"筛选后标的 {len(universe)} 个")
 
     end_date: str = datetime.now().strftime("%Y%m%d")
-    calendar: list[str] = ma._get_trading_dates(ma.FIXED_DATES[0], end_date)
+    calendar: list[str] = market_data.get_trading_dates(ma.FIXED_DATES[0], end_date)
     if not calendar:
         raise RuntimeError(
             f"大 QMT 未返回 {ma.FIXED_DATES[0]} 至 {end_date} 的交易日，请检查 RPC"
@@ -144,7 +117,7 @@ def _run_once(engine: ScriptEngine) -> None:
         )
     engine.write_log(f"读到 {len(series_map)} 个标的的行情")
 
-    trade_date: str = ma._decide_trade_date(engine, series_map, calendar)
+    trade_date: str = market_data.decide_trade_date(engine, series_map, calendar)
     engine.write_log(f"本次计算交易日 T = {trade_date}")
 
     name_map: dict[str, str] = dict(universe)
@@ -202,13 +175,15 @@ def run(engine: ScriptEngine) -> None:
         f"标的池={SECTOR_NAME}，数据源=大QMT RPC，非交易日跳过，等待首个触发点..."
     )
     while engine.is_active():
-        wake_at: datetime = ma._next_run_dt(datetime.now())
+        wake_at: datetime = market_data.next_run_dt(
+            datetime.now(), ma.RUN_HOUR, ma.RUN_MINUTE
+        )
         engine.write_log(f"下次执行时间：{wake_at.strftime('%Y-%m-%d %H:%M:%S')}")
-        if not ma._sleep_until(engine, wake_at):
+        if not market_data.sleep_until(engine, wake_at):
             break
 
         today: datetime = datetime.now()
-        if not ma._is_trading_day(today):
+        if not market_data.is_trading_day(today):
             engine.write_log(f"{today.strftime('%Y-%m-%d')} 非交易日，跳过")
             continue
 

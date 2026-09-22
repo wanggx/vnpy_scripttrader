@@ -1,8 +1,11 @@
 """A 股标的池公共常量。
 
-所有 ``script/`` 脚本统一从此导入，避免市场过滤口径（沪深 A 股、过滤北交所）
-散落多处定义导致漂移。本模块无副作用，不 import xtquant / bigqmt_xtdata，
-MiniQMT 与大 QMT 两套脚本均可安全引用。
+所有脚本统一从此导入，避免市场过滤口径（沪深 A 股、过滤北交所）散落多处定义导致漂移。
+本模块无副作用，不 import xtquant / bigqmt_xtdata，MiniQMT 与大 QMT 两套脚本均可安全引用。
+
+位置：本文件在 ``script/market/`` 目录下（该目录**不放 __init__.py**）。调用方先把自己上层的
+``market`` 目录加入 ``sys.path`` 再 ``from a_share import ...``，例如 ``market_data.py``
+（同目录直接可用）、``download_xtquant_daily.py`` / ``select_near_ma_*.py``。
 """
 
 # xtquant 中沪深 A 股板块名，成分本身即仅含沪市(.SH)、深市(.SZ) A 股，

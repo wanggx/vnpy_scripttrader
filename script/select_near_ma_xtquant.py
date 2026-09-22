@@ -20,19 +20,26 @@
 from __future__ import annotations
 
 import math
-import time
+import sys
 import traceback
-from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
 import bigqmt_xtdata
-import download_xtquant_daily as xt_daily
-from a_share import VALID_MARKETS
-from bigqmt_xtdata import instrument_name, xtdata
+from bigqmt_xtdata import xtdata
 from vnpy_sqlapp import APP_NAME
+
+# 通用取数/交易日/调度工具与 A 股标的池常量在 script/market/ 下
+# （该目录无 __init__.py，直接加入 sys.path 后 import）。
+_MARKET_DIR = Path(__file__).resolve().parent / "market"
+if str(_MARKET_DIR) not in sys.path:
+    sys.path.insert(0, str(_MARKET_DIR))
+
+import market_data  # noqa: E402
+from a_share import VALID_MARKETS  # noqa: E402
 
 if TYPE_CHECKING:
     from vnpy_scripttrader.engine import ScriptEngine
@@ -76,8 +83,6 @@ WEIGHT_MODE: str = "days"
 # 每日定时执行：A 股 15:00 收盘，16:00 当日数据已就绪。
 RUN_HOUR: int = 16
 RUN_MINUTE: int = 0
-# 等待时每步最长睡眠秒数，分段睡眠以快速响应停止操作。
-SLEEP_STEP_SECONDS: int = 60
 
 
 
@@ -93,47 +98,24 @@ def _weight(days: int) -> float:
 def _next_run_dt(now: datetime) -> datetime:
     """返回 now 之后下一个 ``RUN_HOUR:RUN_MINUTE`` 的 datetime。
 
-    若 now 恰好是整点则算作"下一个"（启动不立即触发，符合"等到下一个16:00"）。
+    委托通用数据层；触发点用本模块自己的常量，与其它脚本互不影响。
     """
-    candidate: datetime = now.replace(
-        hour=RUN_HOUR, minute=RUN_MINUTE, second=0, microsecond=0
-    )
-    if candidate <= now:
-        candidate += timedelta(days=1)
-    return candidate
+    return market_data.next_run_dt(now, RUN_HOUR, RUN_MINUTE)
 
 
 def _get_trading_dates(start_time: str, end_time: str) -> list[str]:
-    """获取沪深交易日列表（YYYYMMDD），跳过节假日扩展下载。
-
-    ``xtdata.get_trading_calendar`` 会无条件调 ``download_holiday_data``，
-    部分客户端不支持该功能会抛 ``function not realize``。这里改用
-    ``get_trading_dates``。MiniQMT 多为毫秒时间戳，BigQMT 常直接给
-    YYYYMMDD 字符串，统一经 ``bigqmt_xtdata.trading_dates_to_yyyymmdd`` 规范化。
-    """
-    raw = xtdata.get_trading_dates(
-        market="SH", start_time=start_time, end_time=end_time, count=-1
-    )
-    return bigqmt_xtdata.trading_dates_to_yyyymmdd(raw)
+    """获取沪深交易日列表（YYYYMMDD），委托通用数据层（跳过节假日扩展下载）。"""
+    return market_data.get_trading_dates(start_time, end_time)
 
 
 def _is_trading_day(date: datetime) -> bool:
     """date（含节假日）是否为 A 股交易日，依据 xtquant 沪市交易日。"""
-    date_str: str = date.strftime("%Y%m%d")
-    return date_str in _get_trading_dates(date_str, date_str)
+    return market_data.is_trading_day(date)
 
 
 def _sleep_until(engine: ScriptEngine, wake_at: datetime) -> bool:
     """睡眠至 wake_at，分段以响应停止。返回是否正常醒来到点（False=被停止）。"""
-    now: datetime = datetime.now()
-    while now < wake_at:
-        if not engine.is_active():
-            return False
-        remaining: float = (wake_at - now).total_seconds()
-        step: float = min(SLEEP_STEP_SECONDS, remaining)
-        time.sleep(step)
-        now = datetime.now()
-    return engine.is_active()
+    return market_data.sleep_until(engine, wake_at)
 
 
 def _normalize_bars(df: pd.DataFrame) -> pd.DataFrame:
@@ -176,29 +158,12 @@ def _filter_universe(
     engine: ScriptEngine,
     stock_codes: list[str],
 ) -> list[tuple[str, str]] | None:
-    """筛选标的池：排除 ST/*ST 与合约信息缺失的标的。
+    """筛选标的池：排除 ST/*ST 与合约信息缺失的标的（委托通用数据层）。
 
-    返回 ``[(code, name)]``；用户停止时返回 None。
+    返回 ``[(code, name)]``；用户停止时返回 None。exclude_st 用本模块的 ``EXCLUDE_ST``。
     上市太近、日线数据不足的标的在打分阶段按 ``MIN_BARS`` 过滤（那里才有收盘价数据）。
     """
-    engine.write_log(f"正在读取 {len(stock_codes)} 个标的的合约信息（排除ST）")
-    kept: list[tuple[str, str]] = []
-    total: int = len(stock_codes)
-    for index, code in enumerate(stock_codes, start=1):
-        if not engine.is_active():
-            engine.write_log(f"筛选已停止：已处理 {index - 1}/{total}")
-            return None
-        if index % 500 == 0:
-            engine.write_log(f"筛选进度：{index}/{total}")
-
-        detail: dict[str, Any] | None = xtdata.get_instrument_detail(code)
-        if not detail:
-            continue
-        name: str = instrument_name(detail)
-        if EXCLUDE_ST and "ST" in name.upper():
-            continue
-        kept.append((code, name))
-    return kept
+    return market_data.filter_universe(engine, stock_codes, exclude_st=EXCLUDE_ST)
 
 
 def _download_today(
@@ -208,61 +173,10 @@ def _download_today(
 ) -> bool:
     """先 ``count=1`` 探本地末根，再仅对缺 ``trade_date`` 的标的分批补数。
 
-    缺的才 ``download_history_data2``，且按小批次，禁止一次塞入全市场。
-    下载失败不阻断。用户停止返回 False。
+    委托通用数据层（缺口才 ``download_history_data2``，小批次，失败不阻断）。
+    用户停止返回 False。
     """
-    if not engine.is_active():
-        engine.write_log("当日数据准备已停止（尚未开始）")
-        return False
-
-    codes: list[str] = [code for code, _ in universe]
-    total: int = len(codes)
-    engine.write_log(f"正在探查终端本地日线覆盖（目标日 {trade_date}，{total} 只）")
-    last_dates: dict[str, str] | None = xt_daily.get_last_bar_dates(
-        engine, codes, trade_date
-    )
-    if last_dates is None:
-        return False
-
-    need: list[str] = [
-        code for code in codes if last_dates.get(code, "") < trade_date
-    ]
-    ready: int = total - len(need)
-    engine.write_log(
-        f"本地日线覆盖 {trade_date}：已有 {ready}/{total}，缺 {len(need)}"
-    )
-    if not need:
-        return True
-
-    batch_size: int = max(1, bigqmt_xtdata.DOWNLOAD_TODAY_BATCH_SIZE)
-    engine.write_log(
-        f"开始分批补缺当日日线（{trade_date}）：{len(need)} 只，每批 {batch_size}"
-    )
-    for start in range(0, len(need), batch_size):
-        if not engine.is_active():
-            engine.write_log(f"当日补数已停止：{start}/{len(need)}")
-            return False
-        batch: list[str] = need[start : start + batch_size]
-        try:
-            xtdata.download_history_data2(
-                stock_list=batch,
-                period="1d",
-                start_time=trade_date,
-                end_time=trade_date,
-                incrementally=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            engine.write_log(
-                f"当日补数批次失败 {start + 1}-{start + len(batch)}/{len(need)}：{exc}；"
-                "改用当前本地已有数据继续"
-            )
-            return True
-        engine.write_log(
-            f"当日补数进度：{min(start + len(batch), len(need))}/{len(need)}"
-        )
-
-    engine.write_log(f"当日缺数补数请求已发完：{len(need)} 只")
-    return True
+    return market_data.download_missing_data(engine, universe, trade_date)
 
 
 def _load_bar_series(
@@ -327,33 +241,8 @@ def _decide_trade_date(
     series_map: dict[str, pd.DataFrame],
     calendar: list[str],
 ) -> str:
-    """确定本次计算的交易日 T。
-
-    优先取日历中最近、且有 >=50% 标的具备收盘价的交易日（自动适应盘中数据未就绪）；
-    若日历内均不满足，回退到各标的最后有效日期的众数。
-    """
-    last_dates: list[str] = []
-    for bars in series_map.values():
-        valid: pd.Series = bars["close"].dropna()
-        if valid.size:
-            last_dates.append(valid.index[-1])
-    if not last_dates:
-        raise RuntimeError("未读到任何有效收盘价数据，请检查 xtquant 本地缓存")
-
-    freq: Counter[str] = Counter(last_dates)
-    total: int = len(last_dates)
-    for candidate in reversed(calendar):
-        if freq.get(candidate, 0) >= total * 0.5:
-            if candidate != calendar[-1]:
-                engine.write_log(
-                    f"当日 {calendar[-1]} 数据未就绪（仅 {freq.get(calendar[-1], 0)}/{total} 有数据），"
-                    f"改用前一交易日 {candidate}"
-                )
-            return candidate
-
-    best: str = max(freq, key=lambda d: (freq[d], d))
-    engine.write_log(f"未找到 >=50% 的交易日，使用众数 {best}（{freq[best]}/{total}）")
-    return best
+    """确定本次计算的交易日 T（委托通用数据层，数据未就绪自动回退前一交易日）。"""
+    return market_data.decide_trade_date(engine, series_map, calendar)
 
 
 def _recent_high(close: pd.Series, high: pd.Series, trade_date: str) -> float:

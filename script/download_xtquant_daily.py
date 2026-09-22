@@ -11,12 +11,20 @@ VeighNa 数据库；大 QMT 上 ``download_history_data2`` 常不可用，失败
 3. 全区间失败再按自然年切刀重试。
 """
 
+import sys
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import bigqmt_xtdata
-from a_share import FALLBACK_SECTORS, PRIMARY_SECTOR, VALID_MARKETS
 from bigqmt_xtdata import xtdata
+
+# A 股标的池常量在 script/market/ 下（该目录无 __init__.py，直接加入 sys.path 后 import）。
+_MARKET_DIR = Path(__file__).resolve().parent / "market"
+if str(_MARKET_DIR) not in sys.path:
+    sys.path.insert(0, str(_MARKET_DIR))
+
+from a_share import FALLBACK_SECTORS, PRIMARY_SECTOR, VALID_MARKETS  # noqa: E402
 
 if TYPE_CHECKING:
     from vnpy_scripttrader.engine import ScriptEngine
