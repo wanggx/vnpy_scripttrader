@@ -129,7 +129,7 @@ def _run_once(engine: ScriptEngine) -> None:
             skipped_few_bars += 1
             continue
         info: dict[str, Any] | None = ma._score_symbol(
-            bars["close"], bars["high"], trade_date, window_start
+            bars["close"], bars["high"], bars["low"], trade_date, window_start
         )
         if info is None:
             if ma.REQUIRE_HALVED and ma._is_halved(

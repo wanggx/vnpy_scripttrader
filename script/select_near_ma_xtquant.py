@@ -1,9 +1,10 @@
 """基于 5 个固定日期"成本均线"的选股脚本。
 
 对每个标的，分别计算从固定日期到最新交易日 T 的前复权收盘价均值作为一条均线，
-判断当天收盘价是否在 ``NEAR_THRESHOLD`` 内接近这些均线，按"接近越多 + 时间越久
-(天数越大)权重越大"打分 0-100，选前 ``TOP_N`` 存入 SqlApp 数据库。结果保留"接近
-的均线有哪几根 + 每根天数"，按日期保存，历史数据全部保留、不做清理。
+判断当天收盘价**或最低价**是否在 ``NEAR_THRESHOLD`` 内接近这些均线（两者任一落在
+带内即算靠近），按"接近越多 + 时间越久(天数越大)权重越大"打分 0-100，选前 ``TOP_N``
+存入 SqlApp 数据库。结果保留"接近的均线有哪几根 + 每根天数"，按日期保存，历史数据
+全部保留、不做清理。
 
 开 ``REQUIRE_HALVED`` 时，额外要求 T 日收盘价相对近 ``HIGH_LOOKBACK`` 个交易日
 最高价已腰斩（``close <= 最高价 × HALF_RATIO``），未腰斩的标的在打分前整批剔除。
@@ -51,7 +52,8 @@ if TYPE_CHECKING:
 FIXED_DATES: list[str] = ["20220427", "20221031", "20240205", "20240918", "20250407"]
 # 标的可用前复权日线数据少于此值则不考虑（剔除上市太近、数据不足的新股）。
 MIN_BARS: int = 100
-# 接近标准：|close - ma| / ma <= NEAR_THRESHOLD。
+# 接近标准：|close - ma| / ma <= NEAR_THRESHOLD 或 |low - ma| / ma <= NEAR_THRESHOLD
+# （T 日收盘价、最低价任一落在 ±NEAR_THRESHOLD 带内即算"靠近"）。
 NEAR_THRESHOLD: float = 0.01
 # 近 N 个交易日（不含 T）若收盘跌穿该均线（低于均线超过 BREAK_THRESHOLD），
 # 即使 T 日又回到均线附近也不算接近——跌穿后反抽不算有效贴近。
@@ -119,13 +121,13 @@ def _sleep_until(engine: ScriptEngine, wake_at: datetime) -> bool:
 
 
 def _normalize_bars(df: pd.DataFrame) -> pd.DataFrame:
-    """把 get_market_data_ex 的单标的 DataFrame 转成收盘价/最高价 DataFrame。
+    """把 get_market_data_ex 的单标的 DataFrame 转成收盘价/最高价/最低价 DataFrame。
 
-    保留 ``close``、``high`` 两列；index 统一为 YYYYMMDD 字符串并按日期升序排序，
-    便于 ``.loc[start:T]`` 切片与 ``.iloc[-N:]`` 取近 N 个交易日。兼容 index 为
+    保留 ``close``、``high``、``low`` 三列；index 统一为 YYYYMMDD 字符串并按日期升序
+    排序，便于 ``.loc[start:T]`` 切片与 ``.iloc[-N:]`` 取近 N 个交易日。兼容 index 为
     int 毫秒时间戳 / datetime / 字符串三种格式。
     """
-    bars: pd.DataFrame = df[["close", "high"]].copy()
+    bars: pd.DataFrame = df[["close", "high", "low"]].copy()
     idx = bars.index
     if isinstance(idx, pd.DatetimeIndex):
         ts = idx
@@ -185,7 +187,7 @@ def _load_bar_series(
     start_time: str,
     end_time: str,
 ) -> dict[str, pd.DataFrame] | None:
-    """分批读取全池前复权收盘价/最高价，返回 ``{code: DataFrame}``。
+    """分批读取全池前复权收盘价/最高价/最低价，返回 ``{code: DataFrame}``。
 
     先 ``count=1`` 探覆盖并只对缺目标日的标的分批补数，再一次
     ``get_market_data_ex`` 读全区间。用户停止返回 None。
@@ -208,7 +210,7 @@ def _load_bar_series(
 
         batch: list[str] = codes[start : start + BATCH_SIZE]
         data: dict[str, pd.DataFrame] = xtdata.get_market_data_ex(
-            field_list=["close", "high"],
+            field_list=["close", "high", "low"],
             stock_list=batch,
             period="1d",
             start_time=start_time,
@@ -307,6 +309,7 @@ def _broke_below_ma(valid: pd.Series, trade_date: str) -> bool:
 def _score_symbol(
     close: pd.Series,
     high: pd.Series,
+    low: pd.Series,
     trade_date: str,
     window_start: dict[str, str],
 ) -> dict[str, Any] | None:
@@ -317,6 +320,8 @@ def _score_symbol(
     - REQUIRE_HALVED 且未腰斩 → 跳过整个标的（硬过滤）
     - 上市日晚于均线起点 → 该均线无效（不能把「上市以来均价」当成更早的成本均线）
     - 某均线窗口有效交易日数 < MIN_WINDOW_POINTS → 该均线无效，不进分子也不进分母
+    - T 日收盘价**与最低价都**没落在均线 ±NEAR_THRESHOLD 带内 → 该均线不算靠近
+      （收盘价、最低价任一落在带内即可；low 缺失为 NaN，该侧自然不满足）
     - T 日接近该均线，但近 BREAK_LOOKBACK 日曾跌穿 → 不算接近（跌穿后反抽不计入）
     - 分母只含有效均线，避免无效均线系统性低估分数
     """
@@ -325,6 +330,8 @@ def _score_symbol(
     close_t: float = close.loc[trade_date]
     if pd.isna(close_t) or close_t <= 0:
         return None
+    # T 日最低价（缺失为 NaN → 下面比较自然为 False，等于这一侧不满足）。
+    low_t: float = float(low.loc[trade_date]) if trade_date in low.index else float("nan")
 
     # 腰斩硬过滤：未腰斩的标的整批剔除，不进打分。
     if REQUIRE_HALVED and not _is_halved(close, high, trade_date):
@@ -352,7 +359,10 @@ def _score_symbol(
             continue
         weight: float = _weight(n)
         valid_weight_total += weight
-        if abs(close_t - ma) / ma <= NEAR_THRESHOLD:
+        # 收盘价、最低价任一落在 ±NEAR_THRESHOLD 带内即算"靠近"。
+        near_close: bool = abs(close_t - ma) / ma <= NEAR_THRESHOLD
+        near_low: bool = abs(low_t - ma) / ma <= NEAR_THRESHOLD
+        if near_close or near_low:
             if _broke_below_ma(valid, trade_date):
                 continue
             near_dates.append(fixed_date)
@@ -508,7 +518,7 @@ def _run_sector(
             skipped_few_bars += 1
             continue
         info: dict[str, Any] | None = _score_symbol(
-            bars["close"], bars["high"], trade_date, window_start
+            bars["close"], bars["high"], bars["low"], trade_date, window_start
         )
         if info is None:
             # 区分"未腰斩被剔除"与"无均线接近/数据问题"：仅在腰斩过滤开启时，
