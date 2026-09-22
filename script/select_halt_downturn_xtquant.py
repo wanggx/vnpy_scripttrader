@@ -44,6 +44,7 @@ from __future__ import annotations
 import math
 import sys
 import traceback
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -135,6 +136,23 @@ _INDICATOR_FIELDS: dict[str, tuple[str, int]] = {
 RUN_HOUR: int = 16
 RUN_MINUTE: int = 30
 
+# ---- 过滤漏斗（日志用）----
+# 形态判定的过滤步骤：(统计键, 日志展示名)。**顺序 = ``_detect_halt`` 里的返回顺序**，
+# 调用方按此顺序做「剔除 N 只 → 剩余 M 只」的累积打印；新增/调整判定分支时同步这里，
+# 否则漏斗数字会错位。
+_REJECT_STEPS: tuple[tuple[str, str], ...] = (
+    ("no_close", "T 日无有效收盘价（或缺该日行情）"),
+    ("few_hist", f"近 {DOWNTURN_LOOKBACK} 日有效高点不足 {MIN_WINDOW_POINTS} 个"),
+    ("bad_peak", "前高价格异常（<=0）"),
+    ("no_drop", f"自前高回落不足 {DOWNTURN_DROP:.0%}"),
+    ("few_stars", f"日线不足 {STAR_DAYS} 根"),
+    ("no_doji", f"最近 {STAR_DAYS} 日未连续小十字星"),
+    ("few_vol", "缩量窗口有效交易日不足"),
+    ("no_vol_ref", "缩量参照均量<=0"),
+    ("no_shrink", f"近 {STAR_DAYS} 日均量未缩到参照 {VOL_SHRINK_RATIO:.0%} 以内"),
+    ("low_score", "综合打分<=0"),
+)
+
 # ST/*ST 过滤用通用层的 ``market_data.EXCLUDE_ST``（默认 True），不在本模块重复定义
 # 以免口径漂移；要改口径改通用层。
 
@@ -217,7 +235,11 @@ def _load_ohlcv_series(
     )
 
 
-def _detect_halt(bars: pd.DataFrame, trade_date: str) -> dict[str, Any] | None:
+def _detect_halt(
+    bars: pd.DataFrame,
+    trade_date: str,
+    stats: Counter[str] | None = None,
+) -> dict[str, Any] | None:
     """判定单标的是否命中"下跌后止跌·小十字星+缩量"形态并打分。
 
     返回 ``{close_price, prior_peak_price, drop_from_peak_ratio, vol_avg_recent,
@@ -232,39 +254,48 @@ def _detect_halt(bars: pd.DataFrame, trade_date: str) -> dict[str, Any] | None:
     - 近端或参照均量窗口有效日不足 / 参照均量<=0 → 跳过
     - 近端均量未缩到参照的 VOL_SHRINK_RATIO 以内 → 跳过
     - 综合打分<=0 → 跳过
+
+    每步剔除都会记到 ``stats``（键见 ``_REJECT_STEPS``，按判定顺序累计），调用方据此
+    打印过滤漏斗；``stats`` 为 None 时只做判定、不统计。
     """
+
+    def reject(reason: str) -> None:
+        """记一笔"在这一步被剔除"（``stats`` 为 None 时什么也不做）。"""
+        if stats is not None:
+            stats[reason] += 1
+
     if trade_date not in bars.index:
-        return None
+        return reject("no_close")
     pos: int = bars.index.get_loc(trade_date)
     if isinstance(pos, slice):  # 防御：index 唯一，正常不会返回 slice
         pos = int(pos.stop) - 1
     row_t: pd.Series = bars.iloc[pos]
     close_t: float = float(row_t["close"])
     if pd.isna(close_t) or close_t <= 0:
-        return None
+        return reject("no_close")
 
     # 1. 前置下跌：近 DOWNTURN_LOOKBACK 日（不含 T）最高价。
     lo: int = max(0, pos - DOWNTURN_LOOKBACK)
     hist: pd.DataFrame = bars.iloc[lo:pos]
     hist_valid: pd.Series = hist.loc[_tradable_mask(hist), "high"]
     if hist_valid.size < MIN_WINDOW_POINTS:
-        return None
+        return reject("few_hist")
     high_max: float = float(hist_valid.max())
     if high_max <= 0:
-        return None
+        return reject("bad_peak")
     if close_t > high_max * (1.0 - DOWNTURN_DROP):
-        return None
+        return reject("no_drop")
     drop_pct: float = 1.0 - close_t / high_max
 
     # 2. 连续小十字星：最近 STAR_DAYS 日（含 T）逐日须全部满足。
     star_lo: int = pos - STAR_DAYS + 1
     if star_lo < 0:
-        return None
+        return reject("few_stars")
     tail: pd.DataFrame = bars.iloc[star_lo : pos + 1]
     body_ratios: list[float] = []
     for _, row in tail.iterrows():
         if not _is_doji(row):
-            return None
+            return reject("no_doji")
         rng: float = float(row["high"]) - float(row["low"])
         body_ratios.append(abs(float(row["close"]) - float(row["open"])) / rng)
     body_ratio_mean: float = sum(body_ratios) / len(body_ratios)
@@ -278,14 +309,14 @@ def _detect_halt(bars: pd.DataFrame, trade_date: str) -> dict[str, Any] | None:
     ref: pd.DataFrame = bars.iloc[ref_lo:ref_hi]
     ref_valid: pd.Series = ref.loc[_tradable_mask(ref), "volume"]
     if ref_valid.size < MIN_WINDOW_POINTS:
-        return None
+        return reject("few_vol")
     vol_ref: float = float(ref_valid.mean())
     vol_min_ref: float = float(ref_valid.min())
     if vol_ref <= 0:
-        return None
+        return reject("no_vol_ref")
     shrink_ratio: float = vol_recent / vol_ref
     if shrink_ratio > VOL_SHRINK_RATIO:
-        return None
+        return reject("no_shrink")
 
     # 4. 打分 0-100。
     vol_score: float = (1.0 - shrink_ratio) / (1.0 - VOL_SHRINK_RATIO)
@@ -302,7 +333,7 @@ def _detect_halt(bars: pd.DataFrame, trade_date: str) -> dict[str, Any] | None:
     cont_score: float = min(extra / 3.0, 1.0)
     score: int = round(100.0 * (0.5 * vol_score + 0.3 * star_score + 0.2 * cont_score))
     if score <= 0:
-        return None
+        return reject("low_score")
 
     result: dict[str, Any] = {
         "close_price": round(close_t, 2),
@@ -320,6 +351,31 @@ def _detect_halt(bars: pd.DataFrame, trade_date: str) -> dict[str, Any] | None:
     # 5. T 日指标快照（MACD / KDJ / RSI），随形态结果一起入库。
     result.update(_indicator_snapshot(bars, trade_date))
     return result
+
+
+def _log_funnel(
+    engine: ScriptEngine,
+    total: int,
+    skipped_few_bars: int,
+    reject_stats: Counter[str],
+    hits: int,
+) -> None:
+    """打印逐级过滤漏斗：每一步剔除多少只、过滤后还剩多少只。
+
+    顺序与 ``_detect_halt`` 的判定顺序一致（见 ``_REJECT_STEPS``）；先扣掉调用方在
+    判定前剔除的「有效日线不足 MIN_BARS 条」，再按 ``_REJECT_STEPS`` 顺序累积。
+    """
+    left: int = total - skipped_few_bars
+    engine.write_log(f"判定漏斗：起始 {total} 只")
+    engine.write_log(
+        f"  1) 有效日线不足 {MIN_BARS} 条（新股/长期停牌）："
+        f"剔除 {skipped_few_bars} 只，剩余 {left} 只"
+    )
+    for no, (key, label) in enumerate(_REJECT_STEPS, start=2):
+        dropped: int = reject_stats.get(key, 0)
+        left -= dropped
+        engine.write_log(f"  {no}) {label}：剔除 {dropped} 只，剩余 {left} 只")
+    engine.write_log(f"判定完成：命中止跌形态 {hits} 个（剩余 {left}）")
 
 
 def _opt_float(value: Any) -> float | None:
@@ -506,6 +562,7 @@ def _run_once(engine: ScriptEngine, download_missing: bool | None = None) -> Non
     name_map: dict[str, str] = dict(universe)
     hits: list[dict[str, Any]] = []
     skipped_few_bars: int = 0
+    reject_stats: Counter[str] = Counter()  # 各过滤步骤剔除的标的数（漏斗日志用）
     total: int = len(series_map)
     for index, (code, bars) in enumerate(series_map.items(), start=1):
         if index % 1000 == 0:
@@ -517,16 +574,13 @@ def _run_once(engine: ScriptEngine, download_missing: bool | None = None) -> Non
         if bars["close"].dropna().size < MIN_BARS:
             skipped_few_bars += 1
             continue
-        info: dict[str, Any] | None = _detect_halt(bars, trade_date)
+        info: dict[str, Any] | None = _detect_halt(bars, trade_date, reject_stats)
         if info is None:
             continue
         info["code"] = code
         info["name"] = name_map.get(code, "")
         hits.append(info)
-    engine.write_log(
-        f"判定完成：命中 {len(hits)} 个止跌形态，"
-        f"因日线数据不足 {MIN_BARS} 条剔除 {skipped_few_bars} 个"
-    )
+    _log_funnel(engine, total, skipped_few_bars, reject_stats, len(hits))
 
     hits.sort(key=lambda x: (-x["score"], x["code"]))
     top: list[dict[str, Any]] = hits[:TOP_N]
