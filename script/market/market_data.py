@@ -177,6 +177,9 @@ def load_ohlcv_series(
 
         engine.write_log(f"读取行情进度：{min(start + len(batch), total)}/{total}")
 
+    engine.write_log(
+        f"行情读取完成：{len(result)}/{total} 只有数据（{total - len(result)} 只无数据）"
+    )
     return result
 
 
@@ -283,6 +286,10 @@ def filter_universe(
 
     kept: list[tuple[str, str]] = []
     total: int = len(stock_codes)
+    # 逐步统计"过滤掉多少"：这类日志在池子被筛空时是唯一线索（区分是合约表没覆盖
+    # 还是名称含 ST 被剔除）。
+    missing_contract: int = 0
+    excluded_st: int = 0
 
     for start in range(0, total, FILTER_BATCH_SIZE):
         if not engine.is_active():
@@ -293,13 +300,21 @@ def filter_universe(
         for code in batch:
             name: str = contract_names.get(code, "")
             if not name:
+                missing_contract += 1
                 continue
             if exclude_st and "ST" in name.upper():
+                excluded_st += 1
                 continue
             kept.append((code, name))
 
         engine.write_log(f"筛选进度：{min(start + len(batch), total)}/{total}")
 
+    engine.write_log(
+        f"筛选完成：输入 {total} 个，保留 {len(kept)} 个"
+        f"（合约表未覆盖剔除 {missing_contract} 个"
+        + (f"，ST/*ST 剔除 {excluded_st} 个" if exclude_st else "")
+        + "）"
+    )
     return kept
 
 

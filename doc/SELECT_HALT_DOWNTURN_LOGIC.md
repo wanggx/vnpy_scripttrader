@@ -8,10 +8,15 @@
 
 ## 1. 一句话概括
 
-在全市场沪深 A 股（已去 ST、去新股）中，寻找**“前期大幅下跌”之后出现“近 4 日中至少 2 个小十字星”（条件 A）
-或者“今天（T）极致缩量、见地量”（条件 B）**的底部止跌企稳信号（A、B 满足其一即可，两个都满足最强）；
+在全市场沪深 A 股（已去科创板 688/689、去 ST、去新股）中，寻找**“近 4 日中至少 2 个小十字星”（条件 A）
+或者“今天（T）极致缩量、见地量”（条件 B）**的横盘缩量止跌信号（A、B 满足其一即可，两个都满足最强）；
 按 **缩量程度 + 地量持平度 + 十字星规整度 + 连续天数** 打 0–100 分，取前 100 名写入
-`stock_halt_downturn` 表，并附带 T 日的 MACD / KDJ / RSI 快照。
+`stock_halt_downturn` 表，并附上 T 日的 MACD / KDJ / RSI 快照。
+
+> **2026-09-29 起去掉了“前置下跌”闸门**（原：近 10 个交易日高点回落 ≥ 25% 才入选）。
+> 实测该闸门单独就剔掉约 87% 的标的（全市场 4980 → 剩 620），而真正卡住候选的是条件 A/B；
+> 现在前高与回落幅度只作为 `prior_peak_price` / `drop_from_peak_ratio` 两列入库留档，
+> **不进筛选、不进打分、不进排序**。
 
 ---
 
@@ -24,12 +29,12 @@ flowchart TD
     B -- 是 --> C[取 SqlApp 引擎<br/>检查数据库驱动]
     C --> D{bigqmt_xtdata.ping 可用?}
     D -- 否 --> Z1[本轮结束]
-    D -- 是 --> E[标的池：get_stock_list_in_sector 沪深A股<br/>过滤 .SH/.SZ]
+    D -- 是 --> E[标的池：get_stock_list_in_sector 沪深A股<br/>过滤 .SH/.SZ + 剔除科创板 688/689]
     E --> F[filter_universe：名称只取 MainEngine 合约表<br/>不在表内的直接过滤 / 排除名称含 ST 的标的]
     F --> G[取交易日历 + 读前复权 OHLCV<br/>区间 = 今天往前 400 个日历日]
     G --> H[确定交易日 T<br/>decide_trade_date]
     H --> I[逐标的循环：数据不足 120 根 → 跳过]
-    I --> J[_detect_halt：前置下跌 +（十字星 A 或 地量 B）+ 打分]
+    I --> J[_detect_halt：（十字星 A 或 地量 B）+ 打分<br/>前高/回落只记录]
     J --> K[命中集合排序 score 降序 → 取 TOP 100]
     K --> L[DELETE 当日旧行 → 批量 INSERT]
     L --> A
@@ -46,6 +51,7 @@ flowchart TD
 | 板块成分 | `market_data.get_all_stock_codes()` → `xtdata.get_stock_list_in_sector("沪深A股")` | `a_share.PRIMARY_SECTOR` |
 | 回退板块 | `a_share.FALLBACK_SECTORS = ()` | 默认留空，即不回退（正常"沪深A股"总存在） |
 | 市场过滤 | `code.endswith((".SH", ".SZ"))` | 防御性剔除北交所 `.BJ` 等 |
+| 科创板过滤 | `_get_all_stock_codes()`，`EXCLUDE_CODE_PREFIXES = ("688", "689")` | 剔科创板股票与科创板 CDR，剔除时记日志（口径同 `select_near_ma_all_xtquant`） |
 | 去重排序 | `sorted({...})` | 代码唯一 |
 | ST 过滤 | `market_data.filter_universe()`，`EXCLUDE_ST = True` | 名称 `upper()` 含 `"ST"` 即剔除（覆盖 ST / *ST） |
 | 名称来源 | `market_data.get_contract_names()`：读 MainEngine 已加载合约，**零 RPC** | 见下方说明 |
@@ -96,26 +102,26 @@ flowchart TD
 
 `bars["close"].dropna().size < MIN_BARS(120)` 的标的**直接跳过**，并计入 `skipped_few_bars`
 （剔除上市太近的新股与长期停牌标的）。判定完成后日志汇总：
-`命中 N 个止跌形态，因日线数据不足 120 条剔除 M 个`。
+`命中 N 个止跌形态，因日线数据不足 120 条剔除 M 个`，随后紧跟**判定漏斗**日志（见 6.1）。
 
 ---
 
 ## 5. 核心判定：`_detect_halt(bars, trade_date)`
 
-> **一句话总结：先跌透，然后“躺平（出现小十字星）”与“没人交易（缩量地量）”两者满足其一即可。
-> 前置下跌是必选项，十字星与地量是选择题（两个都满足最强，都不满足则淘汰）。**
+> **一句话总结：“躺平（出现小十字星）”与“没人交易（缩量地量）”两者满足其一即可；
+> 十字星与地量是选择题（两个都满足最强，都不满足则淘汰），没有其他硬条件。**
 
 前置：`trade_date` 必须在 `bars.index` 中，否则返回 `None`。取 `pos = index.get_loc(trade_date)`，
 `row_t = bars.iloc[pos]`。
 
 **T 日收盘价缺失或 `close <= 0` → 跳过。**
-### 5.1 步骤 1：前置下跌（确认“下跌之后”）
+### 5.1 步骤 1：下跌前高与回落幅度（**仅记录，不参与判定**）
 
-> **一句话：这票最近 10 个交易日里从最高点（前高）已经跌掉了至少 25%。**
-> 先把“跌过”这个前提坐实 —— 我们要找的是“跌完之后”开始横盘的，而不是在半山腰横盘的。
+> **一句话：把“近 10 个交易日（不含今天）的最高价”和“现价相对它跌了多少”算出来存进表，
+> 只当背景信息看 —— 它不过滤、不打分、不参与排序。**
 
 ```python
-lo = max(0, pos - DOWNTURN_LOOKBACK)          # DOWNTURN_LOOKBACK = 10
+lo = max(0, pos - DOWNTURN_LOOKBACK)          # DOWNTURN_LOOKBACK = 10（仅记录窗口）
 hist = bars.iloc[lo:pos]                       # T 日之前的 10 个交易日（不含 T）
 hist_valid = hist.loc[_tradable_mask(hist), "high"]
 ```
@@ -126,16 +132,15 @@ hist_valid = hist.loc[_tradable_mask(hist), "high"]
 
   即剔除停牌 / 一字板（`high == low`）/ 异常日。
 
-- 有效日数 `hist_valid.size < MIN_WINDOW_POINTS(3)` → **跳过**；
-- `high_max = hist_valid.max()`（前高）；`high_max <= 0` → **跳过**；
-- 下跌判定（**不满足即跳过**）：
+- 算出则入库：`prior_peak_price = hist_valid.max()`，`drop_from_peak_ratio = 1 - close_T / high_max`；
+- **算不出就写 NULL**：有效日数 < `MIN_WINDOW_POINTS(3)` 或 `high_max <= 0` → 两列都写 NULL，
+  **不因此剔除标的**（这两列只是留档）。
 
-  $$\text{close}_T \le \text{high\_max} \times (1 - \text{DOWNTURN\_DROP}),\quad \text{DOWNTURN\_DROP} = 0.25$$
-
-- 记录回落幅度：`drop_pct = 1 - close_T / high_max`。
-
-> 注意：窗口右端**不含 T**，即前高取的是"最近 10 个交易日内（不含今天）的最高价"（只认短线急跌，不追更早的远高）；
+> 窗口右端**不含 T**：前高取的是“最近 10 个交易日内（不含今天）的有效最高价”；
 > 数据不足 10 根时按实际可用根数（`max(0, pos-10)`）计算。
+> 这两个字段可用来事后复盘“当前这一批标的算不算跌过”，
+> 例如 `WHERE drop_from_peak_ratio >= 0.2` 就能只挑出深跌过的那些（筛选在 SQL 里做，脚本不做）。
+> 实现见 `_drop_from_high(bars, pos, window, close_t)`（返回 `(high_max, drop_pct)` 或 `None`）。
 
 ### 5.2 步骤 2：近端十字星（最近 4 日中至少 2 个小十字星）
 
@@ -152,7 +157,8 @@ tail = bars.iloc[star_lo : pos + 1]   # 含 T 的最近 4 根
 
 对 `tail` **逐根**调用 `_is_doji(row)` **统计十字星天数**（不再要求逐日全部满足）：
 
-- `doji_days` = `tail` 中是十字星的根数；`doji_days < MIN_DOJI_DAYS(2)` → 整只**跳过**（不必连续、不要求最后一天是十字星）；
+- `doji_days` = `tail` 中是十字星的根数；`doji_days < MIN_DOJI_DAYS(2)` → 条件 A **不成立**
+  （不直接跳过：还要看 5.3 的条件 B，两者取“或”；不必连续、不要求最后一天是十字星）；
 - 其余非十字星的日子**不限形态**（大阳/大阴/跳空都行）。
 
 单根要算“小十字星”需同时满足：
@@ -255,7 +261,7 @@ $$\text{score} = 100 \times \Big(0.3 \cdot s_{vol} + 0.2 \cdot s_{floor} + 0.3 \
 | 分项 | 权重 | 定义 | 取值区间 |
 | --- | --- | --- | --- |
 | 缩量程度 $s_{vol}$ | 30% | $\dfrac{1 - \text{shrink\_ratio}}{1 - 0.40}$，截断到 [0,1] | 见下方 ⚠️ |
-| 地量持平度 $s_{floor}$ | 20% | **T 日成交量**与前 60 日**最低量**的相对偏差 $\vert \frac{vol\_min\_recent}{vol\_min\_before} - 1 \vert \le 0.20$ 则得满分，否则 0 分（不硬筛） | $\{0, 1\}$ |
+| 地量持平度 $s_{floor}$ | 20% | **T 日成交量**与前 60 日**最低量**的相对偏差 $\vert \frac{vol\_today}{vol\_min\_before} - 1 \vert \le 0.20$ 则得满分，否则 0 分（不硬筛） | $\{0, 1\}$ |
 | 十字星规整度 $s_{star}$ | 30% | $1 - \text{body\_ratio\_mean}$（实体越小越规整）；**4 天内没十字星时这一项 0 分** | $\{0\} \cup [0.75, 1]$ |
 | 连续天数 $s_{cont}$ | 20% | $\min(\text{extra}/3, 1)$，即向前每多 1 根连续十字星加 1/3 | $\{0, \frac13, \frac23, 1\}$ |
 
@@ -340,6 +346,41 @@ top = hits[:TOP_N]                                   # TOP_N = 100
 
 循环期间每处理 **1000** 只打一次进度日志并检查 `engine.is_active()`（被停止则直接 return 结束本轮）。
 
+### 6.1 判定漏斗日志（每一步过滤掉多少）
+
+命中数很少（甚至为 0）时，光有"命中 N 个"无法定位是哪一步把池子筛空的，
+所以每只标的会在**第一个未通过的步骤**被记一次数（`_Funnel` + `_reject`），
+跑完立刻打一份漏斗日志；A/B 是"或"关系，另附条件分布。
+
+- 计数严格：`各步剔除数之和 + 命中数 = 参与判定总数`；
+- 顺序即判定顺序，与 `_detect_halt` 的提前返回一一对应；
+- `_detect_halt(bars, trade_date, funnel=None)` 的 `funnel` 省略时**完全不开销**（便于单只调试）。
+
+```text
+判定漏斗（T=20260929）：读到行情 5024 个，日线不足 120 条剔除 44 个（0.9%），参与判定 4980 个
+  第 1 步 T 日无收盘价或收盘价<=0：剔除 0 个（0.0%），剩余 4980 个
+  第 2 步 近端窗口不足 4 根（上市太近）：剔除 0 个（0.0%），剩余 4980 个
+  第 3 步 T 日停牌/一字板（量不可信）：剔除 6 个（0.1%），剩余 4974 个
+  第 4 步 缩量参照窗口有效交易日不足 3 天：剔除 0 个（0.0%），剩余 4974 个
+  第 5 步 前 60 日均量<=0：剔除 0 个（0.0%），剩余 4974 个
+  第 6 步 十字星不足 2 天且未缩量（条件 A、B 都不满足）：剔除 4949 个（99.4%），剩余 25 个
+  第 7 步 综合打分<=0：剔除 0 个（0.0%），剩余 25 个
+  命中（进入排序）：25 个（0.5%）
+  条件 A/B 分布（走到该步的 4974 个）：仅 A（近 4 日十字星 >= 2 天） 18 个，仅 B（T 日极致缩量且为地量） 6 个，A、B 同时成立 1 个，都不满足 4949 个
+```
+
+> 读法："剩余"= 通过前 N 步的标的数，百分比 = 该步剔除数 / 参与判定总数。
+> 现在真正卡人的只有**第 6 步（A/B 都不满足）**，而 A/B 里面量能条件（B）比十字星（A）宽松得多，
+> 所以命中集合以"仅 B"为主；若要再多出票，就得调 `VOL_SHRINK_RATIO` / `VOL_MIN_MULTIPLE`
+> 或 `BODY_RATIO` / `RANGE_RATIO` / `MIN_DOJI_DAYS`，而不是调前高相关常量。
+
+上游（通用层 `market_data`）也会打印每一步的过滤量，构成从板块成分到入库的完整链条：
+
+```text
+筛选完成：输入 5052 个，保留 5040 个（合约表未覆盖剔除 0 个，ST/*ST 剔除 12 个）
+行情读取完成：5024/5040 只有数据（16 只无数据）
+```
+
 ---
 
 ## 7. 入库：`_save_results`
@@ -369,13 +410,13 @@ top = hits[:TOP_N]                                   # TOP_N = 100
 | `code` | VARCHAR(16) | 标的代码，如 `000001.SZ`，主键之一 |
 | `name` | VARCHAR(64) | 标的名称（已排除 ST/*ST） |
 | `close_price` | REAL | T 日收盘价（前复权） |
-| `prior_peak_price` | REAL | 下跌前高点：近 10 日（不含 T）有效最高价 |
-| `drop_from_peak_ratio` | REAL | 相对前高回落比例，入选需 ≥ 0.25 |
+| `prior_peak_price` | REAL | 下跌前高点：近 10 日（不含 T）有效最高价（**仅记录**，算不出为 NULL） |
+| `drop_from_peak_ratio` | REAL | 相对前高回落比例（**仅记录**，不参与筛选/打分/排序） |
 | `vol_avg_star` | REAL | 近 STAR_DAYS 日有效交易日均量（**仅记录**，不参与筛选/打分） |
 | `vol_today` | REAL | **T 日成交量**（地量；缩量闸门、地量倍数闸门、地量持平打分都用它） |
 | `vol_avg_before` | REAL | 之前 60 日（紧邻 T）平均成交量（剔除停牌） |
 | `vol_min_before` | REAL | 之前 60 日（紧邻 T）最小成交量（剔除停牌；地量倍数闸门 + 地量持平度打分都用它） |
-| `vol_shrink_ratio` | REAL | 缩量程度 = T 日量 / 前 60 日均量，入选需 ≤ 0.40 |
+| `vol_shrink_ratio` | REAL | 缩量程度 = T 日量 / 前 60 日均量（条件 B 要求 ≤ 0.40 且 ≤ 前 60 日最低量 × 1.2） |
 | `doji_days` | INTEGER | 十字星天数 = 近 4 日内十字星数 + 向前连续延续数（可为 0） |
 | `doji_body_ratio` | REAL | 近 4 日中十字星日的实体/振幅均值（越小越规整；**无十字星时为 NULL**） |
 | `macd_dif` / `macd_dea` / `macd_bar` | REAL | T 日 MACD 三值 |
@@ -404,8 +445,7 @@ top = hits[:TOP_N]                                   # TOP_N = 100
 
 | 常量 | 默认 | 作用 |
 | --- | --- | --- |
-| `DOWNTURN_LOOKBACK` | 10 | 前置下跌参照窗口（交易日，不含 T）；只认短线急跌 |
-| `DOWNTURN_DROP` | 0.25 | 从前高回落 ≥ 25% 才算"下跌之后" |
+| `DOWNTURN_LOOKBACK` | 10 | “下跌前高”的记录窗口（交易日，不含 T）；**仅记录**，不参与筛选/打分 |
 | `STAR_DAYS` | 4 | 近端十字星观察窗口（含 T） |
 | `MIN_DOJI_DAYS` | 2 | 上面这 4 天里至少要有的小十字星天数（不必连续） |
 | `BODY_RATIO` | 0.25 | 实体占振幅上限，$\vert C-O \vert / (H-L) \le 0.25$ |
@@ -420,6 +460,7 @@ top = hits[:TOP_N]                                   # TOP_N = 100
 | `BATCH_SIZE` | `bigqmt_xtdata.READ_BATCH_SIZE` | 每批读取标的数 |
 | `DOWNLOAD_MISSING` | False | 是否先探覆盖 + 补缺当日数据 |
 | `TOP_N` | 100 | 入库条数上限 |
+| `EXCLUDE_CODE_PREFIXES` | `("688", "689")` | 剔除科创板股票 / 科创板 CDR（北交所在通用层已过滤） |
 | `TABLE_NAME` | `stock_halt_downturn` | 结果表 |
 | `READ_LOOKBACK_DAYS` | 400 | 读取区间近端日历日数 |
 | `RUN_HOUR` / `RUN_MINUTE` | 16 / 30 | 每日执行时刻 |
@@ -435,16 +476,21 @@ top = hits[:TOP_N]                                   # TOP_N = 100
 | 阶段 | 跳过条件 | 记录方式 |
 | --- | --- | --- |
 | 取数前 | 大 QMT RPC 不可用 / 无 A 股代码 / 筛选后无标的 | 日志，结束本轮 |
-| 标的级 | `close.dropna().size < 120` | 计入 `skipped_few_bars` 汇总 |
-| `_detect_halt` | T 日不在 index 中 / T 日收盘 NaN 或 ≤ 0 | 静默跳过 |
-| 步骤 1 | 前 10 日有效高点 < 3 个 / `high_max ≤ 0` / 未回落 ≥ 25% | 静默跳过 |
-| 步骤 2 | 最近 4 日不足（`star_lo < 0`，实际上不会发生：`MIN_BARS=120` 已保障） | 静默跳过 |
-| 步骤 3 | **T 日非有效交易日（停牌/一字板）** / 参照窗有效量 < 3 个 / `vol_ref ≤ 0` | 静默跳过 |
-| 步骤 2+3 | **十字星不足 2 日（A 不成立）且量能也不达标（B 不成立）** | 静默跳过 |
-| 步骤 4 | `score <= 0`（严格档下几乎不发生） | 静默跳过 |
+| 标的级 | `close.dropna().size < 120` | 计入 `skipped_few_bars`，漏斗日志首行单列 |
+| `_detect_halt` | T 日不在 index 中 / T 日收盘 NaN 或 ≤ 0 | 漏斗第 1 步 `no_t_close` |
+| 步骤 1 | （前高算不出 → `prior_peak_price` / `drop_from_peak_ratio` 写 NULL，**不剔除**） | — |
+| 步骤 2 | 最近 4 日不足（`star_lo < 0`，实际上不会发生：`MIN_BARS=120` 已保障） | 漏斗第 2 步 `star_window`（防御） |
+| 步骤 3 | **T 日非有效交易日（停牌/一字板）** | 漏斗第 3 步 `t_not_tradable` |
+| 步骤 3 | 参照窗有效量 < 3 个 / `vol_ref ≤ 0` | 漏斗第 4/5 步 `vol_ref_window` / `vol_ref_zero`（防御） |
+| 步骤 2+3 | **十字星不足 2 日（A 不成立）且量能也不达标（B 不成立）** | 漏斗第 6 步 `no_form_no_vol` + A/B 分布行 |
+| 步骤 4 | `score <= 0`（严格档下几乎不发生） | 漏斗第 7 步 `score_zero`（防御） |
 | 其他 | 每 1000 只检查一次用户停止 | 日志并结束本轮 |
 
-> 注意：**“地量持平度”不在上表**——它只影响分数，不满足也只是少得 20 分（排序靠后），不会被剔除。
+> 上表"漏斗第 N 步"= `_FUNNEL_LABELS` 里的键，也是 `_Funnel.rejects` 的键；日志逐条打印
+> `剔除几个 / 剩余几个`（见 6.1）。标为「防御」的步骤在正常数据下恒为 0，出现非 0 说明数据异常。
+>
+> 注意：**"地量持平度"不在上表**——它只影响分数，不满足也只是少得 20 分（排序靠后），不会被剔除。
+> 同理，条件 A 或 B **任一成立**即可入选（第 8 步只在两个都不成立时才剔除）。
 
 ---
 
@@ -456,13 +502,13 @@ detect(bars, T):
     pos   = index_of(T);  close_t = close[pos]
     if close_t is NaN or close_t <= 0: return None
 
-    # 1) 前置下跌
-    hist        = bars[pos-10 : pos]                      # 不含 T
-    highs       = [h for h in hist.high if tradable]      # volume>0, high>0, high>low
-    if len(highs) < 3: return None
-    peak        = max(highs)
-    if close_t > peak * 0.75: return None                 # 未回落 ≥ 25%
-    drop        = 1 - close_t / peak
+    # 1) 前高与回落幅度：只记录（入库 prior_peak_price / drop_from_peak_ratio），不算条件
+    hist  = bars[pos-10 : pos]                            # 不含 T
+    highs = [h for h in hist.high if tradable]            # volume>0, high>0, high>low
+    if len(highs) >= 3:
+        peak = max(highs);  drop = 1 - close_t / peak      # peak/ drop 入库
+    else:
+        peak = drop = None                                 # 写 NULL，不影响是否入选
 
     # 2) 近端 4 日内至少 2 个小十字星（不必连续）→ 条件 A
     tail = bars[pos-3 : pos+1]
@@ -502,8 +548,9 @@ detect(bars, T):
 ## 12. 设计取舍与注意事项
 
 1. **前复权全量重读**：前复权下历史价会随分红整体位移，所以每轮都读全区间，**不做增量拼接**。
-2. **"下跌后止跌"是必要条件而非充分条件**：命中只代表形态相符，不代表买入信号；
+2. **形态相符不是买入信号**：命中只代表符合“横盘 / 缩量”形态，不代表底部已确认；
    是否入场需结合后续 K 线确认（本脚本只负责筛选与入库）。
+   （2026-09-29 起不再要求“前期跌过”，想按跌幅筛就查 `drop_from_peak_ratio` 列。）
 3. **停牌处理口径**：T 日本身必须是有效交易日（停牌/一字板直接拒）；
    近端 4 日窗口不要求天天可交易（只要求其中至少 2 天是有效十字星）；
    参照窗（前 60 日）剔除停牌/一字板后要求至少 `MIN_WINDOW_POINTS = 3` 个有效日。

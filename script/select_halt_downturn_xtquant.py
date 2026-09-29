@@ -1,20 +1,26 @@
-"""全市场 A 股"下跌后止跌"形态扫描（沪深A股，约 5000+ 标的）。
+"""全市场 A 股"横盘缩量止跌"形态扫描（沪深A股，约 5000+ 标的）。
 
-捕捉底部止跌企稳信号：前期有明显下跌，最近连续多日"小十字星 + 极致缩量"。
+标的池：沪深 A 股板块成分，再剔除科创板（``EXCLUDE_CODE_PREFIXES`` 的 688/689）
+与 ST/*ST（通用层 ``market_data.EXCLUDE_ST``）；北交所在通用层已按 ``.SH``/``.SZ`` 过滤。
+
+捕捉横盘缩量信号：最近连续多日"小十字星 + 极致缩量"。
 判定口径（严格档，见模块常量）：
 
-1. 前置下跌——近 ``DOWNTURN_LOOKBACK`` 个交易日（不含 T）最高价相对 T 日收盘价
-   已回落 >= ``DOWNTURN_DROP``（确认"下跌之后"的前提；窗口只有 10 日，
-   即只认「短线急跌后横盘缩量」，不追更早的远高）；
-2. 近端十字星（条件 A）——最近 ``STAR_DAYS`` 日（含 T）中至少有 ``MIN_DOJI_DAYS`` 日是小十字星：
+1. 近端十字星（条件 A）——最近 ``STAR_DAYS`` 日（含 T）中至少有 ``MIN_DOJI_DAYS`` 日是小十字星：
    实体占振幅 ``body/range <= BODY_RATIO``、单日振幅 ``range/close <= RANGE_RATIO``、
    上下影线都 > 0，且非停牌日（``volume>0``、``high>low``）；其余日子不限形态；
-3. 极致缩量（条件 B，只看 T 当天）——T 日成交量 <= 之前 ``VOL_REF_DAYS`` 日（紧邻 T、不含 T）均量 ×
+2. 极致缩量（条件 B，只看 T 当天）——T 日成交量 <= 之前 ``VOL_REF_DAYS`` 日（紧邻 T、不含 T）均量 ×
    ``VOL_SHRINK_RATIO``，且 T 日成交量 <= 前 ``VOL_REF_DAYS`` 日最低量 × ``VOL_MIN_MULTIPLE``
    （后者保证“今天真的是地量”，而不是被巨量天抬高的均量骗了）。
    **A（形态）与 B（量能）取“或”：满足其一即可入选，两个都不满足才淘汰。**
    另外把 T 日成交量与前 ``VOL_REF_DAYS`` 日最低量是否基本持平（±``VOL_FLOOR_TOLERANCE``）
    作为“地量持平度”参与打分（不硬筛）。
+
+**2026-09-29 去掉了"前置下跌"闸门**（原：近 ``DOWNTURN_LOOKBACK`` 日高点回落
+>= 25% 才入选）。理由：该闸门单个就剔掉约 87% 的标的（实测全市场 4980 只 → 剩 620），
+而真正卡住候选的是条件 A/B（两者都不满足的占剩余 99%+）；现在前高与回落幅度只作为
+``prior_peak_price`` / ``drop_from_peak_ratio`` 两列入库留档，**不进筛选、不进打分、
+不进排序**（打分仍是 缩量 / 地量持平 / 十字星规整度 / 连续天数 四项）。
 
 打分 0-100：缩量程度(30%) + 地量持平度(20%) + 十字星规整度(30%) + 连续天数(20%)，取前
 ``TOP_N`` 存入 SqlApp ``stock_halt_downturn`` 表，按交易日幂等写入、历史累积
@@ -40,7 +46,9 @@
 跳过，单轮失败等下一轮，用户停止则退出调度。
 
 本脚本**不依赖** ``select_near_ma_*`` 的代码（只与它们在时间上错开）：取数、交易日历、
-标的池、ST 过滤、调度等待全部来自通用层 ``script/market/market_data.py``。
+标的池、ST 过滤、调度等待全部来自通用层 ``script/market/market_data.py``；
+科创板（688/689）剔除是本脚本自己的 ``EXCLUDE_CODE_PREFIXES``（与
+``select_near_ma_all_xtquant`` 同口径，通用层不关心"不做哪个板"）。
 """
 
 from __future__ import annotations
@@ -77,11 +85,11 @@ if TYPE_CHECKING:
 
 
 # ---- 可配置常量（严格档）----
-# 前置下跌参照窗口（交易日，不含 T）。只往前看最近 10 个交易日内的最高价，
-# 即只认「短线急跌」：配合 DOWNTURN_DROP=0.25 意味着 10 个交易日内跌掉 25%。
+# 「下跌前高」的记录窗口（交易日，不含 T）：近 10 个交易日内（不含今天）的有效最高价。
+# **2026-09-29 起只作记录**：入库 prior_peak_price / drop_from_peak_ratio，**不参与
+# 筛选、打分与排序**。原来的硬闸门是"近 DOWNTURN_LOOKBACK 日高点回落 >= 25%"，
+# 实测单个闸门就剔掉约 87% 的标的（且真正卡住候选的是条件 A/B），故去掉。
 DOWNTURN_LOOKBACK: int = 10
-# 从近 DOWNTURN_LOOKBACK 日最高价回落 >= 该比例才算"下跌之后"（25%）。
-DOWNTURN_DROP: float = 0.25
 # 近端十字星观察窗口（含 T）：这 STAR_DAYS 日里至少 MIN_DOJI_DAYS 日为小十字星。
 STAR_DAYS: int = 4
 # STAR_DAYS 日中至少要有的小十字星天数（不必连续、不要求逐日全是）。
@@ -117,7 +125,7 @@ DOWNLOAD_MISSING: bool = False
 TOP_N: int = 100
 # 结果表名。
 TABLE_NAME: str = "stock_halt_downturn"
-# 读取区间近端日历日数（≈ 270 交易日，够算 10 日下跌 + 60 日缩量参照 + 4 日近端
+# 读取区间近端日历日数（≈ 270 交易日，够算 10 日前高记录 + 60 日缩量参照 + 4 日近端
 # + MIN_BARS 的 120 根门槛 + 缓冲；改大 DOWNTURN_LOOKBACK 时这里仍有富余）。
 READ_LOOKBACK_DAYS: int = 400
 
@@ -150,6 +158,34 @@ RUN_MINUTE: int = 30
 
 # ST/*ST 过滤用通用层的 ``market_data.EXCLUDE_ST``（默认 True），不在本模块重复定义
 # 以免口径漂移；要改口径改通用层。
+
+# 剔除的代码前缀：688xxx = 科创板股票，689xxx = 科创板 CDR，本策略不做科创板。
+# （北交所在通用层已按 .SH/.SZ 过滤掉；口径与 select_near_ma_all_xtquant 一致）
+EXCLUDE_CODE_PREFIXES: tuple[str, ...] = ("688", "689")
+
+
+# ---- 判定漏斗（日志用）----
+# 全市场跑完只剩个位数命中时，光看"命中 1 个"没法判断是哪一步把池子筛空的，
+# 所以每一步"剔除了多少标的"都要能一眼看出来；A/B 是"或"关系，更要分开统计。
+# 键 = 内部代号（``_detect_halt`` 里 ``_reject`` 用），值 = 日志里的中文说明；
+# 字典顺序 = 判定顺序。每只标的只在**第一个**未通过的步骤计一次数（``_detect_halt``
+# 遇错即返回），因此「各步剔除数之和 + 命中数 = 参与判定总数」，是严格的漏斗。
+_FUNNEL_LABELS: dict[str, str] = {
+    "no_t_close": "T 日无收盘价或收盘价<=0",
+    "star_window": f"近端窗口不足 {STAR_DAYS} 根（上市太近）",
+    "t_not_tradable": "T 日停牌/一字板（量不可信）",
+    "vol_ref_window": f"缩量参照窗口有效交易日不足 {MIN_WINDOW_POINTS} 天",
+    "vol_ref_zero": f"前 {VOL_REF_DAYS} 日均量<=0",
+    "no_form_no_vol": f"十字星不足 {MIN_DOJI_DAYS} 天且未缩量（条件 A、B 都不满足）",
+    "score_zero": "综合打分<=0",
+}
+# 条件 A（十字星）/ B（缩量）的分布：在**走到 A/B 判定**的标的里统计，
+# 三项之和 + 上面的 ``no_form_no_vol`` = 走到该步的标的数。
+_COND_LABELS: dict[str, str] = {
+    "cond_a_only": f"仅 A（近 {STAR_DAYS} 日十字星 >= {MIN_DOJI_DAYS} 天）",
+    "cond_b_only": "仅 B（T 日极致缩量且为地量）",
+    "cond_ab": "A、B 同时成立",
+}
 
 
 def _tradable_mask(df: pd.DataFrame) -> pd.Series:
@@ -198,6 +234,27 @@ def _is_doji(row: pd.Series) -> bool:
     return True
 
 
+def _drop_from_high(
+    bars: pd.DataFrame, pos: int, window: int, close_t: float
+) -> tuple[float, float] | None:
+    """近 ``window`` 个交易日（不含 T）的有效最高价（即"下跌前高"），及相对 ``close_t`` 的回落幅度。
+
+    返回 ``(high_max, drop_pct)``，``drop_pct = 1 - close_t / high_max``；有效交易日不足
+    ``MIN_WINDOW_POINTS`` 或 ``high_max <= 0`` 时返回 None（算不了）。
+    **结果只用于入库留档**（``prior_peak_price`` / ``drop_from_peak_ratio``）：
+    2026-09-29 起不再拿它做任何筛选。
+    """
+    lo: int = max(0, pos - window)
+    hist: pd.DataFrame = bars.iloc[lo:pos]
+    hist_valid: pd.Series = hist.loc[_tradable_mask(hist), "high"]
+    if hist_valid.size < MIN_WINDOW_POINTS:
+        return None
+    high_max: float = float(hist_valid.max())
+    if high_max <= 0:
+        return None
+    return high_max, 1.0 - close_t / high_max
+
+
 def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """（保留旧名字）委托通用数据层 ``market_data.normalize_bars``。
 
@@ -205,6 +262,24 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     与其它脚本共用同一套规范化口径（避免各自实现漂移）。
     """
     return market_data.normalize_bars(df, market_data.OHLCV_FIELDS)
+
+
+def _get_all_stock_codes(engine: ScriptEngine) -> list[str]:
+    """取标的池：沪深 A 股（通用层已过滤北交所）+ 剔除科创板 688/689。
+
+    科创板口径与 ``select_near_ma_all_xtquant.EXCLUDE_CODE_PREFIXES`` 一致（本策略不做
+    科创板）——两只脚本都跑全市场，池子口径必须对齐，否则同一张成绩表里会混入不想做的标的。
+    """
+    codes: list[str] = market_data.get_all_stock_codes(engine)
+    kept: list[str] = [
+        code for code in codes if not code.startswith(EXCLUDE_CODE_PREFIXES)
+    ]
+    if len(kept) != len(codes):
+        engine.write_log(
+            f"已剔除科创板（{'/'.join(EXCLUDE_CODE_PREFIXES)} 开头）："
+            f"{len(codes) - len(kept)} 个，剩 {len(kept)} 个"
+        )
+    return kept
 
 
 def _load_ohlcv_series(
@@ -231,52 +306,129 @@ def _load_ohlcv_series(
     )
 
 
-def _detect_halt(bars: pd.DataFrame, trade_date: str) -> dict[str, Any] | None:
-    """判定单标的是否命中"下跌后止跌·小十字星+缩量"形态并打分。
+class _Funnel:
+    """判定漏斗计数器：只统计"在哪一步被剔除/哪支条件成立"，不参与筛选与打分。
+
+    ``rejects`` 按 ``_FUNNEL_LABELS`` 的顺序累计各步剔除数（每只标的只计一次）；
+    ``conds`` 统计走到 A/B 判定那一步的标的里条件分布；``None`` 可关掉统计
+    （``_detect_halt`` 的 ``funnel`` 参数给 None 时不开销，便于单独调试单只标的）。
+    """
+
+    def __init__(self) -> None:
+        self.rejects: dict[str, int] = dict.fromkeys(_FUNNEL_LABELS, 0)
+        self.conds: dict[str, int] = dict.fromkeys(_COND_LABELS, 0)
+
+    def reject(self, key: str) -> None:
+        """记一次「标的在本步骤被剔除」。"""
+        self.rejects[key] += 1
+
+    def condition(self, star_ok: bool, shrink_ok: bool) -> None:
+        """记一次 A/B 条件分布（只在走到该步、两个条件都已判定时调用）。"""
+        if star_ok and shrink_ok:
+            self.conds["cond_ab"] += 1
+        elif star_ok:
+            self.conds["cond_a_only"] += 1
+        elif shrink_ok:
+            self.conds["cond_b_only"] += 1
+
+
+def _reject(funnel: _Funnel | None, key: str) -> None:
+    """记一次「在某步被剔除」并返回 None：让 ``_detect_halt`` 的提前返回都是一行。"""
+    if funnel is not None:
+        funnel.reject(key)
+    return None
+
+
+def _log_funnel(
+    engine: ScriptEngine,
+    trade_date: str,
+    read_total: int,
+    skipped_few_bars: int,
+    judged: int,
+    funnel: _Funnel,
+) -> None:
+    """把判定漏斗按步骤逐条写日志（哪一步剔除了多少、剩多少、占比多少）。
+
+    ``read_total`` = 读到行情的标的数；``skipped_few_bars`` = 其中因日线不足
+    ``MIN_BARS`` 条被剔除的；``judged`` = 真正进入 ``_detect_halt`` 的数量。
+    """
+
+    def _pct(part: int, whole: int) -> float:
+        return part / whole * 100.0 if whole else 0.0
+
+    engine.write_log(
+        f"判定漏斗（T={trade_date}）：读到行情 {read_total} 个，"
+        f"日线不足 {MIN_BARS} 条剔除 {skipped_few_bars} 个"
+        f"（{_pct(skipped_few_bars, read_total):.1f}%），参与判定 {judged} 个"
+    )
+    remaining: int = judged
+    for order, (key, label) in enumerate(_FUNNEL_LABELS.items(), start=1):
+        removed: int = funnel.rejects[key]
+        remaining -= removed
+        engine.write_log(
+            f"  第 {order} 步 {label}：剔除 {removed} 个"
+            f"（{_pct(removed, judged):.1f}%），剩余 {remaining} 个"
+        )
+    engine.write_log(
+        f"  命中（进入排序）：{remaining} 个（{_pct(remaining, judged):.1f}%）"
+    )
+    reached: int = sum(funnel.conds.values()) + funnel.rejects["no_form_no_vol"]
+    if reached:
+        detail: str = "，".join(
+            f"{label} {funnel.conds[key]} 个" for key, label in _COND_LABELS.items()
+        )
+        engine.write_log(
+            f"  条件 A/B 分布（走到该步的 {reached} 个）：{detail}，"
+            f"都不满足 {funnel.rejects['no_form_no_vol']} 个"
+        )
+
+
+def _detect_halt(
+    bars: pd.DataFrame, trade_date: str, funnel: _Funnel | None = None
+) -> dict[str, Any] | None:
+    """判定单标的是否命中"横盘缩量止跌·小十字星+极致缩量"形态并打分。
+
+    ``funnel`` 非 None 时，把"在第一个未通过的那一步"记进漏斗（仅统计，不影响判定）。
 
     返回 ``{close_price, prior_peak_price, drop_from_peak_ratio, vol_avg_star,
     vol_today, vol_avg_before, vol_min_before, vol_shrink_ratio,
     doji_days, doji_body_ratio, score, macd_dif, macd_dea, macd_bar,
     kdj_k, kdj_d, kdj_j, rsi}`` 或 None（跳过）；
-    指标快照只在形态全部命中后才算（不必给全市场都算 MACD/KDJ）：
-    - T 日无收盘价 / 收盘<=0 → 跳过
-    - 近 DOWNTURN_LOOKBACK 日有效高点不足 MIN_WINDOW_POINTS → 跳过
-    - T 日收盘未相对高点回落 >= DOWNTURN_DROP → 跳过
-    - 最近 STAR_DAYS 日（含 T）中有效小十字星不足 MIN_DOJI_DAYS 日 → 跳过
-    - 参照均量窗口有效日不足 / 参照均量<=0 → 跳过
-    - T 日非有效交易日（停牌/一字板）→ 跳过
+    指标快照只在形态全部命中后才算（不必给全市场都算 MACD/KDJ）。
+    前置下跌（``prior_peak_price`` / ``drop_from_peak_ratio``）**只算不用**，不参与筛选。
+    下面的跳过条件括号里是对应的漏斗键（见 ``_FUNNEL_LABELS``，用于日志统计）：
+    - T 日不在 index 中 / 无收盘价 / 收盘<=0 → 跳过（`no_t_close`）
+    - 最近 STAR_DAYS 日（含 T）中有效小十字星不足 MIN_DOJI_DAYS 日 → 条件 A 不成立
+      （**不直接淘汰**，与条件 B 取"或"）
+    - 参照均量窗口有效日不足 / 参照均量<=0 → 跳过（`vol_ref_window` / `vol_ref_zero`）
+    - T 日非有效交易日（停牌/一字板）→ 跳过（`t_not_tradable`）
     - 近端十字星不足 MIN_DOJI_DAYS 日**且**量能也不达标（未缩到 VOL_SHRINK_RATIO 或
-      超过参照窗最低量的 VOL_MIN_MULTIPLE 倍）→ 跳过（两个条件满足其一即可）
-    - 综合打分<=0 → 跳过
+      超过参照窗最低量的 VOL_MIN_MULTIPLE 倍）→ 跳过（`no_form_no_vol`，两个条件满足其一即可）
+    - 综合打分<=0 → 跳过（`score_zero`）
     """
     if trade_date not in bars.index:
-        return None
+        return _reject(funnel, "no_t_close")
     pos: int = bars.index.get_loc(trade_date)
     if isinstance(pos, slice):  # 防御：index 唯一，正常不会返回 slice
         pos = int(pos.stop) - 1
     row_t: pd.Series = bars.iloc[pos]
     close_t: float = float(row_t["close"])
     if pd.isna(close_t) or close_t <= 0:
-        return None
+        return _reject(funnel, "no_t_close")
 
-    # 1. 前置下跌：近 DOWNTURN_LOOKBACK 日（不含 T）最高价。
-    lo: int = max(0, pos - DOWNTURN_LOOKBACK)
-    hist: pd.DataFrame = bars.iloc[lo:pos]
-    hist_valid: pd.Series = hist.loc[_tradable_mask(hist), "high"]
-    if hist_valid.size < MIN_WINDOW_POINTS:
-        return None
-    high_max: float = float(hist_valid.max())
-    if high_max <= 0:
-        return None
-    if close_t > high_max * (1.0 - DOWNTURN_DROP):
-        return None
-    drop_pct: float = 1.0 - close_t / high_max
+    # 1. 下跌前高/回落幅度：**只作记录**（入库 prior_peak_price / drop_from_peak_ratio），
+    #    不参与筛选、打分与排序（原来的硬闸门"近 10 日高点回落 >= 25%" 已去掉）。
+    prior: tuple[float, float] | None = _drop_from_high(
+        bars, pos, DOWNTURN_LOOKBACK, close_t
+    )
+    high_max: float | None = None if prior is None else prior[0]
+    drop_pct: float | None = None if prior is None else prior[1]
 
     # 2. 近端十字星：最近 STAR_DAYS 日（含 T）中至少有 MIN_DOJI_DAYS 日为有效小十字星
     # （不必连续、其余日子不限形态）。
     star_lo: int = pos - STAR_DAYS + 1
     if star_lo < 0:
-        return None
+        return _reject(funnel, "star_window")
     tail: pd.DataFrame = bars.iloc[star_lo : pos + 1]
     body_ratios: list[float] = []
     doji_in_window: int = 0
@@ -298,7 +450,7 @@ def _detect_halt(bars: pd.DataFrame, trade_date: str) -> dict[str, Any] | None:
     # T 日必须是有效交易日（停牌/一字板的量不可信）；近端 4 日均量只作记录，不参与判定。
     t_row: pd.DataFrame = bars.iloc[pos : pos + 1]
     if not bool(_tradable_mask(t_row).iloc[0]):
-        return None
+        return _reject(funnel, "t_not_tradable")
     vol_t: float = float(row_t["volume"])
     tail_valid: pd.Series = tail.loc[_tradable_mask(tail), "volume"]
     vol_avg_star: float | None = (
@@ -309,19 +461,21 @@ def _detect_halt(bars: pd.DataFrame, trade_date: str) -> dict[str, Any] | None:
     ref: pd.DataFrame = bars.iloc[ref_lo:ref_hi]
     ref_valid: pd.Series = ref.loc[_tradable_mask(ref), "volume"]
     if ref_valid.size < MIN_WINDOW_POINTS:
-        return None
+        return _reject(funnel, "vol_ref_window")
     vol_ref: float = float(ref_valid.mean())
     vol_min_ref: float = float(ref_valid.min())
     if vol_ref <= 0:
-        return None
+        return _reject(funnel, "vol_ref_zero")
     shrink_ratio: float = vol_t / vol_ref
     # 2/3 两步的形态条件与量能条件取“或”：只要十字星成立或地量成立其一即可入选。
     shrink_ok: bool = (
         shrink_ratio <= VOL_SHRINK_RATIO
         and vol_t <= vol_min_ref * VOL_MIN_MULTIPLE
     )
+    if funnel is not None:
+        funnel.condition(star_ok, shrink_ok)
     if not (star_ok or shrink_ok):
-        return None
+        return _reject(funnel, "no_form_no_vol")
 
     # 4. 打分 0-100：缩量 30% + 地量持平 20% + 规整度 30% + 连续天数 20%。
     # 靠“或”分支入选时另一支自然拿不到分（例：没有十字星则规整度 0 分）。
@@ -351,12 +505,12 @@ def _detect_halt(bars: pd.DataFrame, trade_date: str) -> dict[str, Any] | None:
         * (0.3 * vol_score + 0.2 * floor_score + 0.3 * star_score + 0.2 * cont_score)
     )
     if score <= 0:
-        return None
+        return _reject(funnel, "score_zero")
 
     result: dict[str, Any] = {
         "close_price": round(close_t, 2),
-        "prior_peak_price": round(high_max, 2),
-        "drop_from_peak_ratio": round(drop_pct, 4),
+        "prior_peak_price": None if high_max is None else round(high_max, 2),
+        "drop_from_peak_ratio": None if drop_pct is None else round(drop_pct, 4),
         "vol_avg_star": vol_avg_star,
         "vol_today": round(vol_t, 0),
         "vol_avg_before": round(vol_ref, 0),
@@ -416,8 +570,8 @@ def _save_results(
         f"code VARCHAR(16) NOT NULL,  -- 标的代码，如 000001.SZ\n"
         f"name VARCHAR(64),  -- 标的名称（已排除 ST/*ST）\n"
         f"close_price REAL,  -- T 日收盘价（前复权）\n"
-        f"prior_peak_price REAL,  -- 下跌前高点：近 {DOWNTURN_LOOKBACK} 日（不含 T）有效最高价\n"
-        f"drop_from_peak_ratio REAL,  -- 相对前高回落比例，>= {DOWNTURN_DROP} 才入选\n"
+        f"prior_peak_price REAL,  -- 下跌前高：近 {DOWNTURN_LOOKBACK} 日（不含 T）有效最高价（仅记录，不筛选；算不出时 NULL）\n"
+        f"drop_from_peak_ratio REAL,  -- 相对前高回落比例（仅记录，不参与筛选/打分/排序；算不出时 NULL）\n"
         f"vol_avg_star REAL,  -- 近 {STAR_DAYS} 日有效交易日均量（仅记录，不参与筛选/打分）\n"
         f"vol_today REAL,  -- T 日成交量（地量；缩量闸门、地量倍数闸门、地量持平打分都用它）\n"
         f"vol_avg_before REAL,  -- 之前 {VOL_REF_DAYS} 日（紧邻 T）平均成交量（剔除停牌）\n"
@@ -508,7 +662,7 @@ def _run_once(engine: ScriptEngine, download_missing: bool | None = None) -> Non
         return
 
     # 板块成分直接读桥接端已有缓存（大 QMT 桥不提供 download_sector_data）。
-    stock_codes: list[str] = market_data.get_all_stock_codes(engine)
+    stock_codes: list[str] = _get_all_stock_codes(engine)
     if not stock_codes:
         engine.write_log("大 QMT 未返回任何 A 股代码，本轮结束")
         return
@@ -555,6 +709,8 @@ def _run_once(engine: ScriptEngine, download_missing: bool | None = None) -> Non
     name_map: dict[str, str] = dict(universe)
     hits: list[dict[str, Any]] = []
     skipped_few_bars: int = 0
+    # 判定漏斗：逐步统计"在哪一步剔除了多少"，跑完立即打日志（命中很少时靠它定位）。
+    funnel: _Funnel = _Funnel()
     total: int = len(series_map)
     for index, (code, bars) in enumerate(series_map.items(), start=1):
         if index % 1000 == 0:
@@ -566,7 +722,7 @@ def _run_once(engine: ScriptEngine, download_missing: bool | None = None) -> Non
         if bars["close"].dropna().size < MIN_BARS:
             skipped_few_bars += 1
             continue
-        info: dict[str, Any] | None = _detect_halt(bars, trade_date)
+        info: dict[str, Any] | None = _detect_halt(bars, trade_date, funnel)
         if info is None:
             continue
         info["code"] = code
@@ -575,6 +731,15 @@ def _run_once(engine: ScriptEngine, download_missing: bool | None = None) -> Non
     engine.write_log(
         f"判定完成：命中 {len(hits)} 个止跌形态，"
         f"因日线数据不足 {MIN_BARS} 条剔除 {skipped_few_bars} 个"
+    )
+    # 每一步过滤掉多少：从"读到行情"一路到"命中"的完整漏斗（含 A/B 条件分布）。
+    _log_funnel(
+        engine,
+        trade_date,
+        read_total=total,
+        skipped_few_bars=skipped_few_bars,
+        judged=total - skipped_few_bars,
+        funnel=funnel,
     )
 
     hits.sort(key=lambda x: (-x["score"], x["code"]))
