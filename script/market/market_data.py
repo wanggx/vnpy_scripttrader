@@ -19,7 +19,8 @@
     trade_date = md.decide_trade_date(engine, series, calendar)
 
 本模块是**唯一**的取数/交易日/标的池实现：交易日历、交易日判定、补缺当日、all-A 标的池、
-ST 过滤、确定交易日 T、调度等待都在这里；``select_near_ma_xtquant`` 等业务脚本反过来
+标的名称（只取 MainEngine 合约表，不发 RPC；不在表内的标的直接过滤）、ST 过滤、确定交易日 T、
+调度等待都在这里；``select_near_ma_xtquant`` 等业务脚本反过来
 复用本模块（不再各自实现一套，避免口径漂移）。前复权下历史价会随分红整体位移，
 所以每轮都读全区间、不做增量拼接。
 
@@ -38,7 +39,7 @@ from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
@@ -54,7 +55,8 @@ for _dir in (_MODULE_DIR, _SCRIPT_DIR):
 import bigqmt_xtdata  # noqa: E402
 import download_xtquant_daily as xt_daily  # noqa: E402
 from a_share import FALLBACK_SECTORS, PRIMARY_SECTOR, VALID_MARKETS  # noqa: E402
-from bigqmt_xtdata import instrument_name, xtdata  # noqa: E402
+from bigqmt_xtdata import xtdata  # noqa: E402
+from vnpy.trader.constant import Exchange  # noqa: E402
 
 if TYPE_CHECKING:
     from vnpy_scripttrader.engine import ScriptEngine
@@ -65,10 +67,17 @@ OHLCV_FIELDS: tuple[str, ...] = ("open", "close", "high", "low", "volume")
 DIVIDEND_TYPE: str = "front"
 # 单次读取批大小；BigQMT RPC 单次超时有限，默认与桥内 chunk 对齐。
 BATCH_SIZE: int = bigqmt_xtdata.READ_BATCH_SIZE
-# 是否排除 ST/*ST（按 InstrumentName 含 "ST" 判断）。
+# 是否排除 ST/*ST（按合约名称含 "ST" 判断）。
 EXCLUDE_ST: bool = True
-# 逐只查合约信息（取名称 / 排除 ST）时的每批标的数；BigQMT 无批量 detail 接口。
-NAME_BATCH_SIZE: int = 50
+# 筛选循环的每批标的数：只影响进度日志与用户停止的检查频率
+# （名称读的是内存里的 MainEngine 合约表，不发 RPC）。
+FILTER_BATCH_SIZE: int = 50
+# vnpy Exchange（合约表里的交易所）-> xtquant 代码后缀；MainEngine 的合约按 vt_symbol
+# 缓存，而选股脚本用 xtquant 代码（000001.SZ），故需要这个反向映射。
+XT_SUFFIX_BY_EXCHANGE: dict[Exchange, str] = {
+    Exchange.SSE: ".SH",
+    Exchange.SZSE: ".SZ",
+}
 # 补缺当日日线时的每批标的数；过大仍可能压垮大 QMT。
 DOWNLOAD_TODAY_BATCH_SIZE: int = bigqmt_xtdata.DOWNLOAD_TODAY_BATCH_SIZE
 # 等待时每步最长睡眠秒数，分段睡眠以快速响应停止操作。
@@ -230,33 +239,60 @@ def get_all_stock_codes(engine: ScriptEngine) -> list[str]:
     return sorted({code for code in stock_codes if code.endswith(VALID_MARKETS)})
 
 
+def get_contract_names(engine: ScriptEngine) -> dict[str, str]:
+    """从 MainEngine 已加载合约构建 ``{xtquant 代码: 名称}`` 映射（零 RPC）。
+
+    网关连上时会批量推送全市场合约（``gateway.on_contract`` → ``MainEngine.contracts``），
+    里面的 ``ContractData.name`` 与 ``get_instrument_detail`` 的 InstrumentName 同源，
+    因此名称不必再逐只走 RPC。只保留 SSE/SZSE（沪深 A 股）且名称非空的合约；
+    返回空字典说明网关尚未推送合约（此时 ``filter_universe`` 会把标的全部过滤掉）。
+    """
+    names: dict[str, str] = {}
+    for contract in engine.main_engine.get_all_contracts():
+        suffix: str | None = XT_SUFFIX_BY_EXCHANGE.get(contract.exchange)
+        if suffix is None or not contract.name:
+            continue
+        names[f"{contract.symbol}{suffix}"] = contract.name
+    return names
+
+
 def filter_universe(
     engine: ScriptEngine,
     stock_codes: list[str],
     *,
     exclude_st: bool = EXCLUDE_ST,
 ) -> list[tuple[str, str]] | None:
-    """读合约信息，排除 ST/*ST。BigQMT 无批量 detail 接口，按 NAME_BATCH_SIZE 逐个查。
+    """构建标的池 ``[(code, name)]``，排除 ST/*ST。
+
+    名称只从 MainEngine 合约表取（``get_contract_names``，读内存、不产生 RPC）：
+    **不在合约表里（或名称为空）的标的直接过滤掉**，不再逐只 ``get_instrument_detail``
+    兜底。因此入口必须加载会批量推送合约的行情网关（如 QMT/XT），否则池子为空。
 
     返回 ``[(code, name)]``；用户停止时返回 None。
     """
-    engine.write_log(f"正在读取 {len(stock_codes)} 个标的的合约信息（排除ST）")
+    contract_names: dict[str, str] = get_contract_names(engine)
+    if not contract_names:
+        engine.write_log(
+            "MainEngine 合约表为空：请确认入口已加载会批量推送合约的行情网关"
+            "（如 QMT/XT），否则标的池会被全部过滤掉"
+        )
+    engine.write_log(
+        f"正在筛选 {len(stock_codes)} 个标的（排除ST）："
+        f"MainEngine 合约表已覆盖 {len(contract_names)} 个，未覆盖的直接过滤"
+    )
+
     kept: list[tuple[str, str]] = []
     total: int = len(stock_codes)
 
-    for start in range(0, total, NAME_BATCH_SIZE):
+    for start in range(0, total, FILTER_BATCH_SIZE):
         if not engine.is_active():
             engine.write_log(f"筛选已停止：已处理 {start}/{total}")
             return None
 
-        batch: list[str] = stock_codes[start : start + NAME_BATCH_SIZE]
+        batch: list[str] = stock_codes[start : start + FILTER_BATCH_SIZE]
         for code in batch:
-            try:
-                detail: dict[str, Any] | None = xtdata.get_instrument_detail(code)
-            except Exception:  # noqa: BLE001 - 单标的失败跳过
-                continue
-            name: str = instrument_name(detail)
-            if not name and not detail:
+            name: str = contract_names.get(code, "")
+            if not name:
                 continue
             if exclude_st and "ST" in name.upper():
                 continue

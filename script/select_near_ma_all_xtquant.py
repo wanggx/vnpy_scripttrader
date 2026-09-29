@@ -52,7 +52,10 @@ def _filter_universe(
     engine: ScriptEngine,
     stock_codes: list[str],
 ) -> list[tuple[str, str]] | None:
-    """读合约信息，排除 ST/*ST（委托通用数据层；口径用 ``ma.EXCLUDE_ST``）。"""
+    """取名称（只读 MainEngine 合约表，不发 RPC；不在表内的标的直接过滤）并排除 ST/*ST。
+
+    委托通用数据层；口径用 ``ma.EXCLUDE_ST``。
+    """
     return market_data.filter_universe(engine, stock_codes, exclude_st=ma.EXCLUDE_ST)
 
 
