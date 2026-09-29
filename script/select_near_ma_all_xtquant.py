@@ -1,8 +1,9 @@
 """全市场 A 股成本均线选股（沪深A股，约 5000+ 标的）。
 
 打分规则、均线日期、腰斩过滤、入库表与 ``select_near_ma_xtquant.py`` 相同，
-区别只在标的池：本脚本跑全部沪深 A 股（过滤北交所），结果以
-``sector_name=沪深A股`` 写入同一张 ``stock_near_ma``（与申万板块结果互不覆盖）。
+区别只在标的池：本脚本跑全部沪深 A 股（过滤北交所 + 科创板 688/689，见
+``EXCLUDE_CODE_PREFIXES``），结果以 ``sector_name=沪深A股`` 写入同一张
+``stock_near_ma``（与申万板块结果互不覆盖）。
 
 经 BigQMT RPC（``bigqmt_xtdata``）读终端本地库。行情读取/补数复用
 ``select_near_ma_xtquant._load_bar_series``。调度与行业版相同：每个交易日 16:00
@@ -42,10 +43,23 @@ if TYPE_CHECKING:
 # 入库时的 sector_name，与申万行业版共用表、靠主键区分。
 SECTOR_NAME: str = PRIMARY_SECTOR
 
+# 剔除的代码前缀：688xxx = 科创板股票，689xxx = 科创板 CDR，本策略不做科创板。
+# （北交所在通用层已按 .SH/.SZ 过滤掉）
+EXCLUDE_CODE_PREFIXES: tuple[str, ...] = ("688", "689")
+
 
 def _get_all_stock_codes(engine: ScriptEngine) -> list[str]:
-    """获取当前沪深 A 股代码（过滤北交所，兼容旧版板块分类；委托通用数据层）。"""
-    return market_data.get_all_stock_codes(engine)
+    """获取当前沪深 A 股代码（过滤北交所 + 科创板 688/689；全量代码委托通用数据层）。"""
+    codes: list[str] = market_data.get_all_stock_codes(engine)
+    kept: list[str] = [
+        code for code in codes if not code.startswith(EXCLUDE_CODE_PREFIXES)
+    ]
+    if len(kept) != len(codes):
+        engine.write_log(
+            f"已剔除科创板（{'/'.join(EXCLUDE_CODE_PREFIXES)} 开头）："
+            f"{len(codes) - len(kept)} 个，剩 {len(kept)} 个"
+        )
+    return kept
 
 
 def _filter_universe(
