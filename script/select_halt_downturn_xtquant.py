@@ -3,21 +3,20 @@
 捕捉底部止跌企稳信号：前期有明显下跌，最近连续多日"小十字星 + 极致缩量"。
 判定口径（严格档，见模块常量）：
 
-1. 前置下跌——近 ``DOWNTURN_LOOKBACK`` 个交易日（不含 T）最高**收盘价**相对 T 日
-   收盘价已回落 >= ``DOWNTURN_DROP``（确认"下跌之后"的前提）。**只看收盘价**，不用
-   盘中最高价：涨跌幅要「收盘 → 收盘」才自洽，日内冲高的上影线不算前高；
-2/3. **连续小十字星 或 极致缩量，满足其一即算命中**（原先要求两者同时满足）：
-   - 连续小十字星——最近 ``STAR_DAYS`` 日（含 T）逐日满足：实体占振幅
-     ``body/range <= BODY_RATIO``、单日振幅 ``range/close <= RANGE_RATIO``、
-     上下影线都 > 0，且非停牌日（``volume>0``、``high>low``）；
-   - 极致缩量——近 ``STAR_DAYS`` 日有效均量 <= 之前 ``VOL_REF_DAYS`` 日有效均量 ×
-     ``VOL_SHRINK_RATIO``（两个窗口都剔除停牌/一字，口径对称）；缩量窗口有效日不足
-     ``MIN_WINDOW_POINTS`` / 参照均量<=0 → 该侧视为不满足。
-   两侧的原始数值（``vol_min_recent`` / ``vol_min_before``、实体振幅均值等）都照常记录，
-   便于复盘 T 前后是不是该区间的“地量”。
+1. 前置下跌——近 ``DOWNTURN_LOOKBACK`` 个交易日（不含 T）最高价相对 T 日收盘价
+   已回落 >= ``DOWNTURN_DROP``（确认"下跌之后"的前提；窗口只有 10 日，
+   即只认「短线急跌后横盘缩量」，不追更早的远高）；
+2. 近端十字星（条件 A）——最近 ``STAR_DAYS`` 日（含 T）中至少有 ``MIN_DOJI_DAYS`` 日是小十字星：
+   实体占振幅 ``body/range <= BODY_RATIO``、单日振幅 ``range/close <= RANGE_RATIO``、
+   上下影线都 > 0，且非停牌日（``volume>0``、``high>low``）；其余日子不限形态；
+3. 极致缩量（条件 B，只看 T 当天）——T 日成交量 <= 之前 ``VOL_REF_DAYS`` 日（紧邻 T、不含 T）均量 ×
+   ``VOL_SHRINK_RATIO``，且 T 日成交量 <= 前 ``VOL_REF_DAYS`` 日最低量 × ``VOL_MIN_MULTIPLE``
+   （后者保证“今天真的是地量”，而不是被巨量天抬高的均量骗了）。
+   **A（形态）与 B（量能）取“或”：满足其一即可入选，两个都不满足才淘汰。**
+   另外把 T 日成交量与前 ``VOL_REF_DAYS`` 日最低量是否基本持平（±``VOL_FLOOR_TOLERANCE``）
+   作为“地量持平度”参与打分（不硬筛）。
 
-打分 0-100：缩量程度(50%) + 十字星规整度(30%) + 连续天数(20%)；**不满足的那一侧计 0 分**，
-所以只靠单一条件入选的标的最高 50 分，两者都满足才能拿高分。取前
+打分 0-100：缩量程度(30%) + 地量持平度(20%) + 十字星规整度(30%) + 连续天数(20%)，取前
 ``TOP_N`` 存入 SqlApp ``stock_halt_downturn`` 表，按交易日幂等写入、历史累积
 不清理。每行同时带上 T 日的指标值（``macd_dif``/``macd_dea``/``macd_bar``、
 ``kdj_k``/``kdj_d``/``kdj_j``、``rsi``），随形态结果一起入库，便于复盘与后置筛选。
@@ -49,7 +48,6 @@ from __future__ import annotations
 import math
 import sys
 import traceback
-from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -79,25 +77,31 @@ if TYPE_CHECKING:
 
 
 # ---- 可配置常量（严格档）----
-# 前置下跌参照窗口（交易日，不含 T）。
-DOWNTURN_LOOKBACK: int = 60
-# 从近 DOWNTURN_LOOKBACK 日最高**收盘价**回落 >= 该比例才算"下跌之后"（25%）。
-# 收盘价口径：不掺盘中最高价，否则上影线会把"前高"抬高、虚增跌幅。
+# 前置下跌参照窗口（交易日，不含 T）。只往前看最近 10 个交易日内的最高价，
+# 即只认「短线急跌」：配合 DOWNTURN_DROP=0.25 意味着 10 个交易日内跌掉 25%。
+DOWNTURN_LOOKBACK: int = 10
+# 从近 DOWNTURN_LOOKBACK 日最高价回落 >= 该比例才算"下跌之后"（25%）。
 DOWNTURN_DROP: float = 0.25
-# 最近连续小十字星天数（含 T）。
+# 近端十字星观察窗口（含 T）：这 STAR_DAYS 日里至少 MIN_DOJI_DAYS 日为小十字星。
 STAR_DAYS: int = 4
+# STAR_DAYS 日中至少要有的小十字星天数（不必连续、不要求逐日全是）。
+MIN_DOJI_DAYS: int = 2
 # 实体占振幅 body/range <= 该值算"十字"（25%）。
 BODY_RATIO: float = 0.25
 # 单日振幅 range/close <= 该值算"小 K 线"（4%）。
 RANGE_RATIO: float = 0.04
-# 是否要求上下影线都 > 0（排除一字板/T 字板，保留真十字星）。
-REQUIRE_BOTH_SHADOWS: bool = True
-# 缩量参照窗口（交易日，不含近 STAR_DAYS）。
+
+# 缩量参照窗口（交易日，紧邻 T 之前的 60 日，不含 T）。
 VOL_REF_DAYS: int = 60
-# 近 STAR_DAYS 日有效均量 <= 参照窗口有效均量 × 该值算"极致缩量"（40%）。
-# 与"连续小十字星"是「或」关系（两者满足其一即入选），所以这一侧不满足不会直接出局。
+# T 日成交量 <= 参照窗口均量 × 该值算"极致缩量"（40%）。
 VOL_SHRINK_RATIO: float = 0.40
-# 均量窗口剔除停牌后至少要有的有效交易日数。
+# “地量持平”容差：T 日成交量与前 VOL_REF_DAYS 日最低量的相对偏差在 ± 该值
+# 以内视为基本持平（参与打分，不硬筛）。
+VOL_FLOOR_TOLERANCE: float = 0.20
+# “地量倍数”上限（硬筛）：T 日成交量 <= 前 VOL_REF_DAYS 日最低量 × 该值。
+# 只比均量不够——均量会被少数巨量天抬高，今天可能仍远离真地量。
+VOL_MIN_MULTIPLE: float = 1.2
+# 高点/均量窗口剔除停牌后至少要有的有效交易日数。
 MIN_WINDOW_POINTS: int = 3
 # 标的可用前复权日线数据少于此值则不考虑（剔除上市太近、数据不足的新股）。
 MIN_BARS: int = 120
@@ -113,7 +117,8 @@ DOWNLOAD_MISSING: bool = False
 TOP_N: int = 100
 # 结果表名。
 TABLE_NAME: str = "stock_halt_downturn"
-# 读取区间近端日历日数（≈ 覆盖 120 交易日，够算 60 日下跌 + 60 日缩量参照 + 缓冲）。
+# 读取区间近端日历日数（≈ 270 交易日，够算 10 日下跌 + 60 日缩量参照 + 4 日近端
+# + MIN_BARS 的 120 根门槛 + 缓冲；改大 DOWNTURN_LOOKBACK 时这里仍有富余）。
 READ_LOOKBACK_DAYS: int = 400
 
 # 入库的指标（name -> 参数覆盖）；键名见 ``indicators.available()``，要少存哪条就删掉对应键。
@@ -143,23 +148,6 @@ _INDICATOR_FIELDS: dict[str, tuple[str, int]] = {
 RUN_HOUR: int = 16
 RUN_MINUTE: int = 30
 
-# ---- 过滤漏斗（日志用）----
-# 形态判定的过滤步骤：(统计键, 日志展示名)。**顺序 = ``_detect_halt`` 里的返回顺序**，
-# 调用方按此顺序做「剔除 N 只 → 剩余 M 只」的累积打印；新增/调整判定分支时同步这里，
-# 否则漏斗数字会错位。
-_REJECT_STEPS: tuple[tuple[str, str], ...] = (
-    ("no_close", "T 日无有效收盘价（或缺该日行情）"),
-    ("few_hist", f"近 {DOWNTURN_LOOKBACK} 日有效收盘价不足 {MIN_WINDOW_POINTS} 个"),
-    ("bad_peak", "前高收盘价异常（<=0）"),
-    ("no_drop", f"自前高（最高收盘价）回落不足 {DOWNTURN_DROP:.0%}"),
-    ("few_stars", f"日线不足 {STAR_DAYS} 根"),
-    (
-        "no_signal",
-        f"近 {STAR_DAYS} 日既非连续小十字星，也未缩到参照 {VOL_SHRINK_RATIO:.0%} 以内",
-    ),
-    ("low_score", "综合打分<=0"),
-)
-
 # ST/*ST 过滤用通用层的 ``market_data.EXCLUDE_ST``（默认 True），不在本模块重复定义
 # 以免口径漂移；要改口径改通用层。
 
@@ -186,7 +174,7 @@ def _is_doji(row: pd.Series) -> bool:
     """单日是否为"有效小十字星"（含非停牌判定）。
 
     条件：非停牌、range>0、body/range <= BODY_RATIO、range/close <= RANGE_RATIO、
-    （可选）上下影线都 > 0。任一不满足返回 False。
+    上下影线都 > 0（排除一字板/T 字板，保留真十字星）。任一不满足返回 False。
     """
     o: float = float(row["open"])
     c: float = float(row["close"])
@@ -204,7 +192,8 @@ def _is_doji(row: pd.Series) -> bool:
         return False
     if rng / c > RANGE_RATIO:
         return False
-    if REQUIRE_BOTH_SHADOWS and (h - max(o, c) <= 0 or min(o, c) - low <= 0):
+    # 上下影线都必须 > 0：排除一字板 / T 字板，只保留“真十字星”。
+    if h - max(o, c) <= 0 or min(o, c) - low <= 0:
         return False
     return True
 
@@ -242,169 +231,144 @@ def _load_ohlcv_series(
     )
 
 
-def _detect_halt(
-    bars: pd.DataFrame,
-    trade_date: str,
-    stats: Counter[str] | None = None,
-) -> dict[str, Any] | None:
+def _detect_halt(bars: pd.DataFrame, trade_date: str) -> dict[str, Any] | None:
     """判定单标的是否命中"下跌后止跌·小十字星+缩量"形态并打分。
 
-    返回 ``{close_price, prior_peak_price, drop_from_peak_ratio, vol_avg_recent,
-    vol_min_recent, vol_avg_before, vol_min_before, vol_shrink_ratio,
-    doji_streak_days, doji_body_ratio, score, macd_dif, macd_dea, macd_bar,
+    返回 ``{close_price, prior_peak_price, drop_from_peak_ratio, vol_avg_star,
+    vol_today, vol_avg_before, vol_min_before, vol_shrink_ratio,
+    doji_days, doji_body_ratio, score, macd_dif, macd_dea, macd_bar,
     kdj_k, kdj_d, kdj_j, rsi}`` 或 None（跳过）；
     指标快照只在形态全部命中后才算（不必给全市场都算 MACD/KDJ）：
     - T 日无收盘价 / 收盘<=0 → 跳过
-    - 近 DOWNTURN_LOOKBACK 日有效收盘价不足 MIN_WINDOW_POINTS → 跳过
-    - T 日收盘未相对前高（最高收盘价）回落 >= DOWNTURN_DROP → 跳过
-    - **小十字星与极致缩量都不满足** → 跳过（两者满足其一即入选）；其中
-      · 小十字星 = 最近 STAR_DAYS 日（含 T）逐日都是有效小十字星（从 T 往前实际连续天数 >= STAR_DAYS）
-      · 极致缩量 = 近 STAR_DAYS 日有效均量 <= 之前 VOL_REF_DAYS 日有效均量 × VOL_SHRINK_RATIO
-        （缩量窗口有效日不足 MIN_WINDOW_POINTS / 参照均量<=0 → 该侧视为不满足）
+    - 近 DOWNTURN_LOOKBACK 日有效高点不足 MIN_WINDOW_POINTS → 跳过
+    - T 日收盘未相对高点回落 >= DOWNTURN_DROP → 跳过
+    - 最近 STAR_DAYS 日（含 T）中有效小十字星不足 MIN_DOJI_DAYS 日 → 跳过
+    - 参照均量窗口有效日不足 / 参照均量<=0 → 跳过
+    - T 日非有效交易日（停牌/一字板）→ 跳过
+    - 近端十字星不足 MIN_DOJI_DAYS 日**且**量能也不达标（未缩到 VOL_SHRINK_RATIO 或
+      超过参照窗最低量的 VOL_MIN_MULTIPLE 倍）→ 跳过（两个条件满足其一即可）
     - 综合打分<=0 → 跳过
-
-    每步剔除都会记到 ``stats``（键见 ``_REJECT_STEPS``，按判定顺序累计），调用方据此
-    打印过滤漏斗；``stats`` 为 None 时只做判定、不统计。
     """
-
-    def reject(reason: str) -> None:
-        """记一笔"在这一步被剔除"（``stats`` 为 None 时什么也不做）。"""
-        if stats is not None:
-            stats[reason] += 1
-
     if trade_date not in bars.index:
-        return reject("no_close")
+        return None
     pos: int = bars.index.get_loc(trade_date)
     if isinstance(pos, slice):  # 防御：index 唯一，正常不会返回 slice
         pos = int(pos.stop) - 1
     row_t: pd.Series = bars.iloc[pos]
     close_t: float = float(row_t["close"])
     if pd.isna(close_t) or close_t <= 0:
-        return reject("no_close")
+        return None
 
-    # 1. 前置下跌：近 DOWNTURN_LOOKBACK 日（不含 T）的最高**收盘价**。
-    #    一律走收盘价口径（不取盘中最高价）：涨跌幅要「收盘 → 收盘」比较才自洽，
-    #    日内冲高留下的上影线不算"前高"。
+    # 1. 前置下跌：近 DOWNTURN_LOOKBACK 日（不含 T）最高价。
     lo: int = max(0, pos - DOWNTURN_LOOKBACK)
     hist: pd.DataFrame = bars.iloc[lo:pos]
-    hist_valid: pd.Series = hist.loc[_tradable_mask(hist), "close"]
+    hist_valid: pd.Series = hist.loc[_tradable_mask(hist), "high"]
     if hist_valid.size < MIN_WINDOW_POINTS:
-        return reject("few_hist")
-    peak_close: float = float(hist_valid.max())
-    if peak_close <= 0:
-        return reject("bad_peak")
-    if close_t > peak_close * (1.0 - DOWNTURN_DROP):
-        return reject("no_drop")
-    drop_pct: float = 1.0 - close_t / peak_close
+        return None
+    high_max: float = float(hist_valid.max())
+    if high_max <= 0:
+        return None
+    if close_t > high_max * (1.0 - DOWNTURN_DROP):
+        return None
+    drop_pct: float = 1.0 - close_t / high_max
 
-    # 2/3. 连续小十字星与极致缩量：**满足其一**即算命中（原先要求两者同时满足）。
-    #      两侧都先各自算出来（含入库用的原始数值），最后统一按 or 判定出局。
+    # 2. 近端十字星：最近 STAR_DAYS 日（含 T）中至少有 MIN_DOJI_DAYS 日为有效小十字星
+    # （不必连续、其余日子不限形态）。
     star_lo: int = pos - STAR_DAYS + 1
     if star_lo < 0:
-        return reject("few_stars")
+        return None
     tail: pd.DataFrame = bars.iloc[star_lo : pos + 1]
-
-    # 2a. 连续小十字星：从 T 往前数实际连续天数（含 T），不必逐日提前 return。
-    streak: int = 0
-    i: int = pos
-    while i >= 0 and _is_doji(bars.iloc[i]):
-        streak += 1
-        i -= 1
-    doji_ok: bool = streak >= STAR_DAYS
-
-    # 近 STAR_DAYS 日实体/振幅均值（只统计有振幅的交易日；全无振幅则记 NULL）。
     body_ratios: list[float] = []
+    doji_in_window: int = 0
     for _, row in tail.iterrows():
-        rng: float = float(row["high"]) - float(row["low"])
-        if pd.isna(rng) or rng <= 0:
+        if not _is_doji(row):
             continue
+        doji_in_window += 1
+        rng: float = float(row["high"]) - float(row["low"])
         body_ratios.append(abs(float(row["close"]) - float(row["open"])) / rng)
-    body_ratio_mean: float = (
-        sum(body_ratios) / len(body_ratios) if body_ratios else float("nan")
+    # 形态条件 A：近端小十字星够不够；不够也不直接淘汰，与量能条件 B 取“或”。
+    star_ok: bool = doji_in_window >= MIN_DOJI_DAYS
+    # 规整度只按“是十字星的那几天”平均：把大阳/大阴日算进来会把规整度拉歪；
+    # 一天十字星都没有（仅靠量能入选）时没有“规整度”可言，记 None（入库 NULL）。
+    body_ratio_mean: float | None = (
+        sum(body_ratios) / len(body_ratios) if body_ratios else None
     )
 
-    # 3a. 极致缩量：近端/参照两个窗口都只统计有效交易日（口径对称，避免停牌日凑出"缩量"）。
+    # 3. 极致缩量（只看 T 当天）：T 日成交量 / 之前 VOL_REF_DAYS 日（紧邻 T、不含 T）均量。
+    # T 日必须是有效交易日（停牌/一字板的量不可信）；近端 4 日均量只作记录，不参与判定。
+    t_row: pd.DataFrame = bars.iloc[pos : pos + 1]
+    if not bool(_tradable_mask(t_row).iloc[0]):
+        return None
+    vol_t: float = float(row_t["volume"])
     tail_valid: pd.Series = tail.loc[_tradable_mask(tail), "volume"]
-    vol_recent: float = float(tail_valid.mean()) if tail_valid.size else float("nan")
-    vol_min: float = float(tail_valid.min()) if tail_valid.size else float("nan")
-    ref_lo: int = max(0, pos - STAR_DAYS - VOL_REF_DAYS + 1)
-    ref_hi: int = pos - STAR_DAYS + 1  # 不含近端窗口
+    vol_avg_star: float | None = (
+        round(float(tail_valid.mean()), 0) if tail_valid.size else None
+    )
+    ref_lo: int = max(0, pos - VOL_REF_DAYS)
+    ref_hi: int = pos  # 不含 T
     ref: pd.DataFrame = bars.iloc[ref_lo:ref_hi]
     ref_valid: pd.Series = ref.loc[_tradable_mask(ref), "volume"]
-    vol_ref: float = float(ref_valid.mean()) if ref_valid.size else float("nan")
-    vol_min_ref: float = float(ref_valid.min()) if ref_valid.size else float("nan")
-    # 任一侧有效日不足就判不了缩量 → 记 NaN，该侧视为不满足。
-    shrink_ratio: float = (
-        vol_recent / vol_ref
-        if vol_ref > 0 and tail_valid.size >= MIN_WINDOW_POINTS
-        else float("nan")
-    )
+    if ref_valid.size < MIN_WINDOW_POINTS:
+        return None
+    vol_ref: float = float(ref_valid.mean())
+    vol_min_ref: float = float(ref_valid.min())
+    if vol_ref <= 0:
+        return None
+    shrink_ratio: float = vol_t / vol_ref
+    # 2/3 两步的形态条件与量能条件取“或”：只要十字星成立或地量成立其一即可入选。
     shrink_ok: bool = (
-        ref_valid.size >= MIN_WINDOW_POINTS
-        and not math.isnan(shrink_ratio)
-        and shrink_ratio <= VOL_SHRINK_RATIO
+        shrink_ratio <= VOL_SHRINK_RATIO
+        and vol_t <= vol_min_ref * VOL_MIN_MULTIPLE
     )
+    if not (star_ok or shrink_ok):
+        return None
 
-    # 4. 两者都不满足才出局；只满足一侧的照样打分（未满足的那侧计 0 分）。
-    if not doji_ok and not shrink_ok:
-        return reject("no_signal")
-
-    # 5. 打分 0-100。
-    vol_score: float = 0.0
-    if shrink_ok:
-        vol_score = (1.0 - shrink_ratio) / (1.0 - VOL_SHRINK_RATIO)
-        vol_score = max(0.0, min(1.0, vol_score))
-    star_score: float = 0.0
-    if doji_ok and not math.isnan(body_ratio_mean):
-        star_score = max(0.0, 1.0 - body_ratio_mean)
-    cont_score: float = 0.0
-    if doji_ok:
-        cont_score = min((streak - STAR_DAYS) / 3.0, 1.0)
-    score: int = round(100.0 * (0.5 * vol_score + 0.3 * star_score + 0.2 * cont_score))
+    # 4. 打分 0-100：缩量 30% + 地量持平 20% + 规整度 30% + 连续天数 20%。
+    # 靠“或”分支入选时另一支自然拿不到分（例：没有十字星则规整度 0 分）。
+    vol_score: float = (1.0 - shrink_ratio) / (1.0 - VOL_SHRINK_RATIO)
+    vol_score = max(0.0, min(1.0, vol_score))
+    # 地量持平度：T 日成交量与前 VOL_REF_DAYS 日最低量的相对偏差在 ±VOL_FLOOR_TOLERANCE
+    # 以内算“基本持平”给满分，否则不给分（不硬筛，只影响排序）。
+    floor_score: float = (
+        1.0
+        if abs(vol_t / vol_min_ref - 1.0) <= VOL_FLOOR_TOLERANCE
+        else 0.0
+    )
+    star_score: float = (
+        max(0.0, 1.0 - body_ratio_mean) if body_ratio_mean is not None else 0.0
+    )
+    # 向前再数连续小十字星的额外天数，作为连续性加分。
+    extra: int = 0
+    i: int = pos - STAR_DAYS
+    while i >= 0:
+        if not _is_doji(bars.iloc[i]):
+            break
+        extra += 1
+        i -= 1
+    cont_score: float = min(extra / 3.0, 1.0)
+    score: int = round(
+        100.0
+        * (0.3 * vol_score + 0.2 * floor_score + 0.3 * star_score + 0.2 * cont_score)
+    )
     if score <= 0:
-        return reject("low_score")
+        return None
 
     result: dict[str, Any] = {
         "close_price": round(close_t, 2),
-        "prior_peak_price": round(peak_close, 2),
+        "prior_peak_price": round(high_max, 2),
         "drop_from_peak_ratio": round(drop_pct, 4),
-        "vol_avg_recent": _round_or_none(vol_recent, 0),
-        "vol_min_recent": _round_or_none(vol_min, 0),
-        "vol_avg_before": _round_or_none(vol_ref, 0),
-        "vol_min_before": _round_or_none(vol_min_ref, 0),
-        "vol_shrink_ratio": _round_or_none(shrink_ratio, 4),
-        "doji_streak_days": streak,
-        "doji_body_ratio": _round_or_none(body_ratio_mean, 4),
+        "vol_avg_star": vol_avg_star,
+        "vol_today": round(vol_t, 0),
+        "vol_avg_before": round(vol_ref, 0),
+        "vol_min_before": round(vol_min_ref, 0),
+        "vol_shrink_ratio": round(shrink_ratio, 4),
+        "doji_days": doji_in_window + extra,
+        "doji_body_ratio": None if body_ratio_mean is None else round(body_ratio_mean, 4),
         "score": score,
     }
     # 5. T 日指标快照（MACD / KDJ / RSI），随形态结果一起入库。
     result.update(_indicator_snapshot(bars, trade_date))
     return result
-
-
-def _log_funnel(
-    engine: ScriptEngine,
-    total: int,
-    skipped_few_bars: int,
-    reject_stats: Counter[str],
-    hits: int,
-) -> None:
-    """打印逐级过滤漏斗：每一步剔除多少只、过滤后还剩多少只。
-
-    顺序与 ``_detect_halt`` 的判定顺序一致（见 ``_REJECT_STEPS``）；先扣掉调用方在
-    判定前剔除的「有效日线不足 MIN_BARS 条」，再按 ``_REJECT_STEPS`` 顺序累积。
-    """
-    left: int = total - skipped_few_bars
-    engine.write_log(f"判定漏斗：起始 {total} 只")
-    engine.write_log(
-        f"  1) 有效日线不足 {MIN_BARS} 条（新股/长期停牌）："
-        f"剔除 {skipped_few_bars} 只，剩余 {left} 只"
-    )
-    for no, (key, label) in enumerate(_REJECT_STEPS, start=2):
-        dropped: int = reject_stats.get(key, 0)
-        left -= dropped
-        engine.write_log(f"  {no}) {label}：剔除 {dropped} 只，剩余 {left} 只")
-    engine.write_log(f"判定完成：命中止跌形态 {hits} 个（剩余 {left}）")
 
 
 def _opt_float(value: Any) -> float | None:
@@ -418,16 +382,6 @@ def _opt_float(value: Any) -> float | None:
     if math.isnan(number) or math.isinf(number):
         return None
     return number
-
-
-def _round_or_none(value: float, digits: int) -> float | None:
-    """四舍五入到 ``digits`` 位；NaN / inf → None（写库落 NULL）。
-
-    用于「窗口无有效数据」的字段（近端全停牌、参照窗口点不足、缩量判不了等），
-    避免把 NaN 写进库。
-    """
-    number: float | None = _opt_float(value)
-    return None if number is None else round(number, digits)
 
 
 def _indicator_snapshot(bars: pd.DataFrame, trade_date: str) -> dict[str, float | None]:
@@ -462,15 +416,15 @@ def _save_results(
         f"code VARCHAR(16) NOT NULL,  -- 标的代码，如 000001.SZ\n"
         f"name VARCHAR(64),  -- 标的名称（已排除 ST/*ST）\n"
         f"close_price REAL,  -- T 日收盘价（前复权）\n"
-        f"prior_peak_price REAL,  -- 下跌前高点：近 {DOWNTURN_LOOKBACK} 日（不含 T）最高收盘价（收盘口径）\n"
+        f"prior_peak_price REAL,  -- 下跌前高点：近 {DOWNTURN_LOOKBACK} 日（不含 T）有效最高价\n"
         f"drop_from_peak_ratio REAL,  -- 相对前高回落比例，>= {DOWNTURN_DROP} 才入选\n"
-        f"vol_avg_recent REAL,  -- 近 {STAR_DAYS} 日有效交易日平均成交量（剔除停牌）\n"
-        f"vol_min_recent REAL,  -- 近 {STAR_DAYS} 日最小成交量（地量，剔除停牌）\n"
-        f"vol_avg_before REAL,  -- 之前 {VOL_REF_DAYS} 日平均成交量（剔除停牌）\n"
-        f"vol_min_before REAL,  -- 之前 {VOL_REF_DAYS} 日最小成交量（剔除停牌）\n"
-        f"vol_shrink_ratio REAL,  -- 缩量程度 = recent/before；<= {VOL_SHRINK_RATIO} 即算满足缩量（与十字星满足其一即可）\n"
-        f"doji_streak_days INTEGER,  -- 从 T 往前实际连续小十字星天数\n"
-        f"doji_body_ratio REAL,  -- 近 {STAR_DAYS} 日实体/振幅均值（只统计有振幅的日子；越小越规整）\n"
+        f"vol_avg_star REAL,  -- 近 {STAR_DAYS} 日有效交易日均量（仅记录，不参与筛选/打分）\n"
+        f"vol_today REAL,  -- T 日成交量（地量；缩量闸门、地量倍数闸门、地量持平打分都用它）\n"
+        f"vol_avg_before REAL,  -- 之前 {VOL_REF_DAYS} 日（紧邻 T）平均成交量（剔除停牌）\n"
+        f"vol_min_before REAL,  -- 之前 {VOL_REF_DAYS} 日（紧邻 T）最小成交量（剔除停牌；地量倍数硬筛 + 地量持平度打分都用它）\n"
+        f"vol_shrink_ratio REAL,  -- 缩量程度 = T 日量/前 {VOL_REF_DAYS} 日均量，<= {VOL_SHRINK_RATIO} 才入选\n"
+        f"doji_days INTEGER,  -- 十字星天数 = 近 {STAR_DAYS} 日内十字星数 + 向前连续延续数\n"
+        f"doji_body_ratio REAL,  -- 近 {STAR_DAYS} 日中十字星日的实体/振幅均值（越小越规整；无十字星时为 NULL）\n"
         f"macd_dif REAL,  -- MACD 快线 DIF = EMA(close,{ind.MACD_FAST}) - EMA(close,{ind.MACD_SLOW})\n"
         f"macd_dea REAL,  -- MACD 慢线 DEA = EMA(DIF,{ind.MACD_SIGNAL})\n"
         f"macd_bar REAL,  -- MACD 柱 = 2 × (DIF - DEA)\n"
@@ -478,7 +432,7 @@ def _save_results(
         f"kdj_d REAL,  -- KDJ 的 D = SMA(K,{ind.KDJ_M2},1)\n"
         f"kdj_j REAL,  -- KDJ 的 J = 3K - 2D\n"
         f"rsi REAL,  -- RSI（Wilder 平滑，周期 {_RSI_N}）\n"
-        f"score INTEGER,  -- 综合打分 0-100（缩量 50% + 十字星 30% + 连续天数 20%）\n"
+        f"score INTEGER,  -- 综合打分 0-100（缩量 30% + 地量持平 20% + 十字星 30% + 连续天数 20%）\n"
         f"PRIMARY KEY (trade_date, code)\n"
         f")"
     )
@@ -488,8 +442,8 @@ def _save_results(
     insert: str = (
         f"INSERT INTO {TABLE_NAME} "
         f"(trade_date, code, name, close_price, prior_peak_price, drop_from_peak_ratio, "
-        f"vol_avg_recent, vol_min_recent, vol_avg_before, vol_min_before, vol_shrink_ratio, "
-        f"doji_streak_days, doji_body_ratio, macd_dif, macd_dea, macd_bar, "
+        f"vol_avg_star, vol_today, vol_avg_before, vol_min_before, vol_shrink_ratio, "
+        f"doji_days, doji_body_ratio, macd_dif, macd_dea, macd_bar, "
         f"kdj_k, kdj_d, kdj_j, rsi, score) "
         f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, "
         f"{ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})"
@@ -502,12 +456,12 @@ def _save_results(
             r["close_price"],
             r["prior_peak_price"],
             r["drop_from_peak_ratio"],
-            r["vol_avg_recent"],
-            r["vol_min_recent"],
+            r["vol_avg_star"],
+            r["vol_today"],
             r["vol_avg_before"],
             r["vol_min_before"],
             r["vol_shrink_ratio"],
-            r["doji_streak_days"],
+            r["doji_days"],
             r["doji_body_ratio"],
             r["macd_dif"],
             r["macd_dea"],
@@ -601,7 +555,6 @@ def _run_once(engine: ScriptEngine, download_missing: bool | None = None) -> Non
     name_map: dict[str, str] = dict(universe)
     hits: list[dict[str, Any]] = []
     skipped_few_bars: int = 0
-    reject_stats: Counter[str] = Counter()  # 各过滤步骤剔除的标的数（漏斗日志用）
     total: int = len(series_map)
     for index, (code, bars) in enumerate(series_map.items(), start=1):
         if index % 1000 == 0:
@@ -613,13 +566,16 @@ def _run_once(engine: ScriptEngine, download_missing: bool | None = None) -> Non
         if bars["close"].dropna().size < MIN_BARS:
             skipped_few_bars += 1
             continue
-        info: dict[str, Any] | None = _detect_halt(bars, trade_date, reject_stats)
+        info: dict[str, Any] | None = _detect_halt(bars, trade_date)
         if info is None:
             continue
         info["code"] = code
         info["name"] = name_map.get(code, "")
         hits.append(info)
-    _log_funnel(engine, total, skipped_few_bars, reject_stats, len(hits))
+    engine.write_log(
+        f"判定完成：命中 {len(hits)} 个止跌形态，"
+        f"因日线数据不足 {MIN_BARS} 条剔除 {skipped_few_bars} 个"
+    )
 
     hits.sort(key=lambda x: (-x["score"], x["code"]))
     top: list[dict[str, Any]] = hits[:TOP_N]

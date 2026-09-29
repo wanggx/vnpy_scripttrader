@@ -160,8 +160,9 @@ def _filter_universe(
     engine: ScriptEngine,
     stock_codes: list[str],
 ) -> list[tuple[str, str]] | None:
-    """筛选标的池：排除 ST/*ST 与合约信息缺失的标的（委托通用数据层）。
+    """筛选标的池：排除 ST/*ST，以及不在 MainEngine 合约表里的标的（委托通用数据层）。
 
+    名称只从 MainEngine 合约表取（零 RPC），因此入口需已加载批量推送合约的行情网关。
     返回 ``[(code, name)]``；用户停止时返回 None。exclude_st 用本模块的 ``EXCLUDE_ST``。
     上市太近、日线数据不足的标的在打分阶段按 ``MIN_BARS`` 过滤（那里才有收盘价数据）。
     """
