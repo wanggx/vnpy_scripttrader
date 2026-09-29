@@ -12,15 +12,18 @@
 2. 极致缩量（条件 B，只看 T 当天）——T 日成交量 <= 之前 ``VOL_REF_DAYS`` 日（紧邻 T、不含 T）均量 ×
    ``VOL_SHRINK_RATIO``，且 T 日成交量 <= 前 ``VOL_REF_DAYS`` 日最低量 × ``VOL_MIN_MULTIPLE``
    （后者保证“今天真的是地量”，而不是被巨量天抬高的均量骗了）。
-   **A（形态）与 B（量能）取“或”：满足其一即可入选，两个都不满足才淘汰。**
+   **A（形态）与 B（量能）默认取“且”：两者必须同时成立（``REQUIRE_BOTH_CONDITIONS=True``）；
+   设 False 则回到“或”（满足其一即可）。**
    另外把 T 日成交量与前 ``VOL_REF_DAYS`` 日最低量是否基本持平（±``VOL_FLOOR_TOLERANCE``）
    作为“地量持平度”参与打分（不硬筛）。
 
 **2026-09-29 去掉了"前置下跌"闸门**（原：近 ``DOWNTURN_LOOKBACK`` 日高点回落
 >= 25% 才入选）。理由：该闸门单个就剔掉约 87% 的标的（实测全市场 4980 只 → 剩 620），
-而真正卡住候选的是条件 A/B（两者都不满足的占剩余 99%+）；现在前高与回落幅度只作为
+而真正卡住候选的是条件 A/B；现在前高与回落幅度只作为
 ``prior_peak_price`` / ``drop_from_peak_ratio`` 两列入库留档，**不进筛选、不进打分、
 不进排序**（打分仍是 缩量 / 地量持平 / 十字星规整度 / 连续天数 四项）。
+去掉后"或"口径一次放进 1259 个（太宽），故同时把 A/B 改成"且"
+（``REQUIRE_BOTH_CONDITIONS=True``，一个开关可切回"或"）。
 
 打分 0-100：缩量程度(30%) + 地量持平度(20%) + 十字星规整度(30%) + 连续天数(20%)，取前
 ``TOP_N`` 存入 SqlApp ``stock_halt_downturn`` 表，按交易日幂等写入、历史累积
@@ -90,6 +93,12 @@ if TYPE_CHECKING:
 # 筛选、打分与排序**。原来的硬闸门是"近 DOWNTURN_LOOKBACK 日高点回落 >= 25%"，
 # 实测单个闸门就剔掉约 87% 的标的（且真正卡住候选的是条件 A/B），故去掉。
 DOWNTURN_LOOKBACK: int = 10
+# 条件 A（十字星）与条件 B（缩量）的组合方式：
+# True  = 必须同时满足（"且"，严格档，默认，2026-09-29 由"或"改为"且"：
+#         去掉前置下跌闸门后"或"会一次放进 1259 个，太宽）；
+# False = 满足其一即可（"或"）。
+# 只改这一个开关就能两种口径切换，漏斗日志会把两者的命中数都打出来供对比。
+REQUIRE_BOTH_CONDITIONS: bool = True
 # 近端十字星观察窗口（含 T）：这 STAR_DAYS 日里至少 MIN_DOJI_DAYS 日为小十字星。
 STAR_DAYS: int = 4
 # STAR_DAYS 日中至少要有的小十字星天数（不必连续、不要求逐日全是）。
@@ -166,25 +175,49 @@ EXCLUDE_CODE_PREFIXES: tuple[str, ...] = ("688", "689")
 
 # ---- 判定漏斗（日志用）----
 # 全市场跑完只剩个位数命中时，光看"命中 1 个"没法判断是哪一步把池子筛空的，
-# 所以每一步"剔除了多少标的"都要能一眼看出来；A/B 是"或"关系，更要分开统计。
+# 所以每一步"剔除了多少标的"都要能一眼看出来；A/B 的组合口径（且/或）也要能对比。
 # 键 = 内部代号（``_detect_halt`` 里 ``_reject`` 用），值 = 日志里的中文说明；
 # 字典顺序 = 判定顺序。每只标的只在**第一个**未通过的步骤计一次数（``_detect_halt``
 # 遇错即返回），因此「各步剔除数之和 + 命中数 = 参与判定总数」，是严格的漏斗。
+#
+# A/B 这段特意**按逻辑拆步**：十字星（形态）与缩量（量能）本来就是两套独立规则，
+# 日志里也要能分别看到"各剔除了多少"，所以"且"口径下是两个独立步骤；
+# 只有回到"或"口径时才没法拆（一个不成立不淘汰，合起来看才准）。
+if REQUIRE_BOTH_CONDITIONS:
+    _COMBO_STEPS: tuple[tuple[str, str], ...] = (
+        (
+            "no_form",
+            f"十字星不足（条件 A 不成立：近 {STAR_DAYS} 日内小十字星 < {MIN_DOJI_DAYS} 天）",
+        ),
+        (
+            "no_shrink",
+            f"缩量不达标（条件 B 不成立：T 日量未 <= 前 {VOL_REF_DAYS} 日均量×"
+            f"{VOL_SHRINK_RATIO:.0%}，或 > 前 {VOL_REF_DAYS} 日最低量×{VOL_MIN_MULTIPLE}）",
+        ),
+    )
+else:
+    _COMBO_STEPS = (
+        (
+            "no_form_no_vol",
+            f"十字星不足 {MIN_DOJI_DAYS} 天且未缩量（条件 A、B 都不满足）",
+        ),
+    )
 _FUNNEL_LABELS: dict[str, str] = {
     "no_t_close": "T 日无收盘价或收盘价<=0",
     "star_window": f"近端窗口不足 {STAR_DAYS} 根（上市太近）",
     "t_not_tradable": "T 日停牌/一字板（量不可信）",
     "vol_ref_window": f"缩量参照窗口有效交易日不足 {MIN_WINDOW_POINTS} 天",
     "vol_ref_zero": f"前 {VOL_REF_DAYS} 日均量<=0",
-    "no_form_no_vol": f"十字星不足 {MIN_DOJI_DAYS} 天且未缩量（条件 A、B 都不满足）",
+    **dict(_COMBO_STEPS),
     "score_zero": "综合打分<=0",
 }
-# 条件 A（十字星）/ B（缩量）的分布：在**走到 A/B 判定**的标的里统计，
-# 三项之和 + 上面的 ``no_form_no_vol`` = 走到该步的标的数。
+# 条件 A（十字星）/ B（缩量）的分布：在**走到 A/B 判定**的标的里统计（四类互斥、
+# 之和 = 走到该步的标的数），日志里用来判断"该放宽哪一支"。
 _COND_LABELS: dict[str, str] = {
-    "cond_a_only": f"仅 A（近 {STAR_DAYS} 日十字星 >= {MIN_DOJI_DAYS} 天）",
-    "cond_b_only": "仅 B（T 日极致缩量且为地量）",
+    "cond_a_only": f"仅 A 成立（近 {STAR_DAYS} 日十字星 >= {MIN_DOJI_DAYS} 天，但没缩量）",
+    "cond_b_only": "仅 B 成立（缩量且为地量，但不够十字星）",
     "cond_ab": "A、B 同时成立",
+    "cond_none": "A、B 都不成立",
 }
 
 
@@ -330,6 +363,8 @@ class _Funnel:
             self.conds["cond_a_only"] += 1
         elif shrink_ok:
             self.conds["cond_b_only"] += 1
+        else:
+            self.conds["cond_none"] += 1
 
 
 def _reject(funnel: _Funnel | None, key: str) -> None:
@@ -372,14 +407,24 @@ def _log_funnel(
     engine.write_log(
         f"  命中（进入排序）：{remaining} 个（{_pct(remaining, judged):.1f}%）"
     )
-    reached: int = sum(funnel.conds.values()) + funnel.rejects["no_form_no_vol"]
+    # A/B 分布：走到这一步的标的被分成四类（仅 A / 仅 B / A+B / 都不成立），
+    # 四类之和 = 走到该步的标的数；两个口径各自会命中多少也能直接算出来。
+    reached: int = sum(funnel.conds.values())
     if reached:
         detail: str = "，".join(
             f"{label} {funnel.conds[key]} 个" for key, label in _COND_LABELS.items()
         )
+        both: int = funnel.conds["cond_ab"]
+        either: int = reached - funnel.conds["cond_none"]
+        engine.write_log(f"  条件 A/B 分布（走到该步的 {reached} 个）：{detail}")
         engine.write_log(
-            f"  条件 A/B 分布（走到该步的 {reached} 个）：{detail}，"
-            f"都不满足 {funnel.rejects['no_form_no_vol']} 个"
+            f"    若改成「且」会命中 {both} 个，若改成「或」会命中 {either} 个；"
+            f"当前口径 = "
+            + (
+                "且（REQUIRE_BOTH_CONDITIONS=True）"
+                if REQUIRE_BOTH_CONDITIONS
+                else "或（REQUIRE_BOTH_CONDITIONS=False）"
+            )
         )
 
 
@@ -399,11 +444,12 @@ def _detect_halt(
     下面的跳过条件括号里是对应的漏斗键（见 ``_FUNNEL_LABELS``，用于日志统计）：
     - T 日不在 index 中 / 无收盘价 / 收盘<=0 → 跳过（`no_t_close`）
     - 最近 STAR_DAYS 日（含 T）中有效小十字星不足 MIN_DOJI_DAYS 日 → 条件 A 不成立
-      （**不直接淘汰**，与条件 B 取"或"）
     - 参照均量窗口有效日不足 / 参照均量<=0 → 跳过（`vol_ref_window` / `vol_ref_zero`）
     - T 日非有效交易日（停牌/一字板）→ 跳过（`t_not_tradable`）
-    - 近端十字星不足 MIN_DOJI_DAYS 日**且**量能也不达标（未缩到 VOL_SHRINK_RATIO 或
-      超过参照窗最低量的 VOL_MIN_MULTIPLE 倍）→ 跳过（`no_form_no_vol`，两个条件满足其一即可）
+    - 条件 A/B 组合不达标（**十字星与缩量是两套独立规则，各设一道卡、各统各的剔除数**）：
+      默认 ``REQUIRE_BOTH_CONDITIONS=True`` → 十字星不足跳过（`no_form`），
+      十字星成立但缩量不达标也跳过（`no_shrink`）；
+      设 False（"或"）时一个不成立不淘汰、只能合起来判 → 都不成立才跳过（`no_form_no_vol`）
     - 综合打分<=0 → 跳过（`score_zero`）
     """
     if trade_date not in bars.index:
@@ -467,18 +513,26 @@ def _detect_halt(
     if vol_ref <= 0:
         return _reject(funnel, "vol_ref_zero")
     shrink_ratio: float = vol_t / vol_ref
-    # 2/3 两步的形态条件与量能条件取“或”：只要十字星成立或地量成立其一即可入选。
+    # 2/3 两步的形态条件与量能条件按 ``REQUIRE_BOTH_CONDITIONS`` 组合：
+    # 默认"且"（十字星与地量都要），设 False 则回到"或"。
     shrink_ok: bool = (
         shrink_ratio <= VOL_SHRINK_RATIO
         and vol_t <= vol_min_ref * VOL_MIN_MULTIPLE
     )
     if funnel is not None:
         funnel.condition(star_ok, shrink_ok)
-    if not (star_ok or shrink_ok):
+    if REQUIRE_BOTH_CONDITIONS:
+        # 两个独立逻辑各自设卡：先形态（十字星），再量能（缩量），
+        # 这样日志里能分别看到"十字星剔了多少 / 缩量剔了多少"。
+        if not star_ok:
+            return _reject(funnel, "no_form")
+        if not shrink_ok:
+            return _reject(funnel, "no_shrink")
+    elif not (star_ok or shrink_ok):
         return _reject(funnel, "no_form_no_vol")
 
     # 4. 打分 0-100：缩量 30% + 地量持平 20% + 规整度 30% + 连续天数 20%。
-    # 靠“或”分支入选时另一支自然拿不到分（例：没有十字星则规整度 0 分）。
+    # 两支都要求时缩量项与规整度项都不会是 0（见 §5.4 的说明），区分度靠后三项。
     vol_score: float = (1.0 - shrink_ratio) / (1.0 - VOL_SHRINK_RATIO)
     vol_score = max(0.0, min(1.0, vol_score))
     # 地量持平度：T 日成交量与前 VOL_REF_DAYS 日最低量的相对偏差在 ±VOL_FLOOR_TOLERANCE
