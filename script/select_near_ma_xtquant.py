@@ -397,7 +397,8 @@ def _save_results(
     engine: ScriptEngine,
 ) -> None:
     """建表、幂等写入当日结果（只覆盖同交易日同板块的旧行，不清理历史）。"""
-    ph: str = "?" if driver == "sqlite" else "%s"
+    # DuckDB 与 sqlite 一样用 ``?`` 占位符；只有 mysql/postgresql 用 ``%s``
+    ph: str = "?" if driver in ("sqlite", "duckdb") else "%s"
 
     ddl: str = (
         f"CREATE TABLE IF NOT EXISTS {TABLE_NAME} ("

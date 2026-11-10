@@ -411,7 +411,7 @@ top = hits[:TOP_N]                                   # TOP_N = 100
 - 表名 `TABLE_NAME = "stock_halt_downturn"`，主键 `(trade_date, code)`。
 - **幂等写入、历史不清理**：同一交易日内先 `DELETE FROM ... WHERE trade_date = ?` 再批量
   `executemany` 插入（整个操作包在一个 `sql_engine.transaction()` 里）。
-- 占位符按驱动选择：`sqlite` → `?`，其它（mysql）→ `%s`。
+- 占位符按驱动选择：`sqlite` / `duckdb` → `?`，其它（mysql / postgresql）→ `%s`。
 - 建表语句中列说明直接写成 `--` **行内 SQL 注释**（sqlite 会存进 `sqlite_master.sql`，`.schema` 可见）；
   注意逗号必须写在注释之前，否则会被注释掉。
 - 表结构变动**不做自动迁移**：新增字段用 `ALTER TABLE ... ADD COLUMN`，改名用 `RENAME COLUMN`。

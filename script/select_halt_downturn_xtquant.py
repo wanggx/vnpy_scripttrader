@@ -614,10 +614,11 @@ def _save_results(
     engine: ScriptEngine,
 ) -> None:
     """建表（带列说明）、幂等写入当日结果（只覆盖同交易日的旧行，不清理历史）。"""
-    ph: str = "?" if driver == "sqlite" else "%s"
+    # DuckDB 与 sqlite 一样用 ``?`` 占位符；只有 mysql/postgresql 用 ``%s``
+    ph: str = "?" if driver in ("sqlite", "duckdb") else "%s"
 
-    # 列说明直接写在建表 SQL 里（-- 行内注释，sqlite / mysql 都合法；sqlite 会存进
-    # sqlite_master.sql，``.schema`` 可见）。注意逗号必须写在注释之前，否则会被 `--` 注释掉。
+    # 列说明直接写在建表 SQL 里（-- 行内注释，sqlite / mysql / duckdb 都合法；sqlite 会
+    # 存进 sqlite_master.sql，``.schema`` 可见）。注意逗号必须写在注释之前，否则会被 `--` 注释掉。
     ddl: str = (
         f"CREATE TABLE IF NOT EXISTS {TABLE_NAME} (\n"
         f"trade_date VARCHAR(8) NOT NULL,  -- 交易日 T（YYYYMMDD）\n"
