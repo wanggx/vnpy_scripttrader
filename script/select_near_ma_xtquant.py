@@ -40,6 +40,7 @@ if str(_MARKET_DIR) not in sys.path:
     sys.path.insert(0, str(_MARKET_DIR))
 
 import market_data  # noqa: E402
+import db_schema  # noqa: E402
 from a_share import VALID_MARKETS  # noqa: E402
 
 if TYPE_CHECKING:
@@ -77,6 +78,11 @@ HIGH_LOOKBACK: int = 252
 BATCH_SIZE: int = bigqmt_xtdata.READ_BATCH_SIZE
 # 结果表名。
 TABLE_NAME: str = "stock_near_ma"
+# 结果表的定点小数列（原 REAL 会留下长小数，见 script/market/db_schema.py）。
+DECIMAL_COLUMNS: dict[str, str] = {
+    "close": "DECIMAL(18,2)",
+    "high52w": "DECIMAL(18,2)",
+}
 # xtquant 中的完整 sector 名称；多个板块用英文逗号分隔。
 TARGET_SECTOR_NAME: str = "SW2半导体,SW3半导体设备,SW2贵金属,SW2小金属"
 # 打分权重模式：days=天数即权重 / equal=等权(仅看接近条数) / log=对数压缩。
@@ -406,8 +412,8 @@ def _save_results(
         f"sector_name VARCHAR(191) NOT NULL, "
         f"code VARCHAR(16) NOT NULL, "
         f"name VARCHAR(64), "
-        f"close REAL, "
-        f"high52w REAL, "
+        f"close DECIMAL(18,2), "
+        f"high52w DECIMAL(18,2), "
         f"score INTEGER, "
         f"near_dates VARCHAR(64), "
         f"near_days VARCHAR(64), "
@@ -416,6 +422,8 @@ def _save_results(
         f")"
     )
     sql_engine.execute(ddl)
+    # 旧表是 REAL，CREATE TABLE IF NOT EXISTS 不会改列类型，这里幂等迁移
+    db_schema.ensure_decimal_columns(sql_engine, driver, TABLE_NAME, DECIMAL_COLUMNS)
 
     delete_today: str = (
         f"DELETE FROM {TABLE_NAME} WHERE trade_date = {ph} AND sector_name = {ph}"

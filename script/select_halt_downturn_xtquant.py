@@ -80,6 +80,7 @@ for _dir in (_TALIB_DIR, _MARKET_DIR):
 
 import indicators as ind  # noqa: E402
 import market_data  # noqa: E402
+import db_schema  # noqa: E402
 from a_share import PRIMARY_SECTOR  # noqa: E402
 
 if TYPE_CHECKING:
@@ -134,6 +135,27 @@ DOWNLOAD_MISSING: bool = False
 TOP_N: int = 100
 # 结果表名。
 TABLE_NAME: str = "stock_halt_downturn"
+# 结果表的定点小数列（原 REAL 会留下长小数，见 script/market/db_schema.py）。
+# 价格/成交量按 2 位（分/股），比率与价格量级的指标按 4 位（太小的小数位会把
+# 0.0123 这样的比率压成 0.01，失去筛选价值）。
+DECIMAL_COLUMNS: dict[str, str] = {
+    "close_price": "DECIMAL(18,2)",
+    "prior_peak_price": "DECIMAL(18,2)",
+    "vol_avg_star": "DECIMAL(18,2)",
+    "vol_today": "DECIMAL(18,2)",
+    "vol_avg_before": "DECIMAL(18,2)",
+    "vol_min_before": "DECIMAL(18,2)",
+    "drop_from_peak_ratio": "DECIMAL(18,4)",
+    "vol_shrink_ratio": "DECIMAL(18,4)",
+    "doji_body_ratio": "DECIMAL(18,4)",
+    "macd_dif": "DECIMAL(18,4)",
+    "macd_dea": "DECIMAL(18,4)",
+    "macd_bar": "DECIMAL(18,4)",
+    "kdj_k": "DECIMAL(18,2)",
+    "kdj_d": "DECIMAL(18,2)",
+    "kdj_j": "DECIMAL(18,2)",
+    "rsi": "DECIMAL(18,2)",
+}
 # 读取区间近端日历日数（≈ 270 交易日，够算 10 日前高记录 + 60 日缩量参照 + 4 日近端
 # + MIN_BARS 的 120 根门槛 + 缓冲；改大 DOWNTURN_LOOKBACK 时这里仍有富余）。
 READ_LOOKBACK_DAYS: int = 400
@@ -624,28 +646,30 @@ def _save_results(
         f"trade_date VARCHAR(8) NOT NULL,  -- 交易日 T（YYYYMMDD）\n"
         f"code VARCHAR(16) NOT NULL,  -- 标的代码，如 000001.SZ\n"
         f"name VARCHAR(64),  -- 标的名称（已排除 ST/*ST）\n"
-        f"close_price REAL,  -- T 日收盘价（前复权）\n"
-        f"prior_peak_price REAL,  -- 下跌前高：近 {DOWNTURN_LOOKBACK} 日（不含 T）有效最高价（仅记录，不筛选；算不出时 NULL）\n"
-        f"drop_from_peak_ratio REAL,  -- 相对前高回落比例（仅记录，不参与筛选/打分/排序；算不出时 NULL）\n"
-        f"vol_avg_star REAL,  -- 近 {STAR_DAYS} 日有效交易日均量（仅记录，不参与筛选/打分）\n"
-        f"vol_today REAL,  -- T 日成交量（地量；缩量闸门、地量倍数闸门、地量持平打分都用它）\n"
-        f"vol_avg_before REAL,  -- 之前 {VOL_REF_DAYS} 日（紧邻 T）平均成交量（剔除停牌）\n"
-        f"vol_min_before REAL,  -- 之前 {VOL_REF_DAYS} 日（紧邻 T）最小成交量（剔除停牌；地量倍数硬筛 + 地量持平度打分都用它）\n"
-        f"vol_shrink_ratio REAL,  -- 缩量程度 = T 日量/前 {VOL_REF_DAYS} 日均量，<= {VOL_SHRINK_RATIO} 才入选\n"
+        f"close_price DECIMAL(18,2),  -- T 日收盘价（前复权）\n"
+        f"prior_peak_price DECIMAL(18,2),  -- 下跌前高：近 {DOWNTURN_LOOKBACK} 日（不含 T）有效最高价（仅记录，不筛选；算不出时 NULL）\n"
+        f"drop_from_peak_ratio DECIMAL(18,4),  -- 相对前高回落比例（仅记录，不参与筛选/打分/排序；算不出时 NULL）\n"
+        f"vol_avg_star DECIMAL(18,2),  -- 近 {STAR_DAYS} 日有效交易日均量（仅记录，不参与筛选/打分）\n"
+        f"vol_today DECIMAL(18,2),  -- T 日成交量（地量；缩量闸门、地量倍数闸门、地量持平打分都用它）\n"
+        f"vol_avg_before DECIMAL(18,2),  -- 之前 {VOL_REF_DAYS} 日（紧邻 T）平均成交量（剔除停牌）\n"
+        f"vol_min_before DECIMAL(18,2),  -- 之前 {VOL_REF_DAYS} 日（紧邻 T）最小成交量（剔除停牌；地量倍数硬筛 + 地量持平度打分都用它）\n"
+        f"vol_shrink_ratio DECIMAL(18,4),  -- 缩量程度 = T 日量/前 {VOL_REF_DAYS} 日均量，<= {VOL_SHRINK_RATIO} 才入选\n"
         f"doji_days INTEGER,  -- 十字星天数 = 近 {STAR_DAYS} 日内十字星数 + 向前连续延续数\n"
-        f"doji_body_ratio REAL,  -- 近 {STAR_DAYS} 日中十字星日的实体/振幅均值（越小越规整；无十字星时为 NULL）\n"
-        f"macd_dif REAL,  -- MACD 快线 DIF = EMA(close,{ind.MACD_FAST}) - EMA(close,{ind.MACD_SLOW})\n"
-        f"macd_dea REAL,  -- MACD 慢线 DEA = EMA(DIF,{ind.MACD_SIGNAL})\n"
-        f"macd_bar REAL,  -- MACD 柱 = 2 × (DIF - DEA)\n"
-        f"kdj_k REAL,  -- KDJ 的 K = SMA(RSV,{ind.KDJ_M1},1)\n"
-        f"kdj_d REAL,  -- KDJ 的 D = SMA(K,{ind.KDJ_M2},1)\n"
-        f"kdj_j REAL,  -- KDJ 的 J = 3K - 2D\n"
-        f"rsi REAL,  -- RSI（Wilder 平滑，周期 {_RSI_N}）\n"
+        f"doji_body_ratio DECIMAL(18,4),  -- 近 {STAR_DAYS} 日中十字星日的实体/振幅均值（越小越规整；无十字星时为 NULL）\n"
+        f"macd_dif DECIMAL(18,4),  -- MACD 快线 DIF = EMA(close,{ind.MACD_FAST}) - EMA(close,{ind.MACD_SLOW})\n"
+        f"macd_dea DECIMAL(18,4),  -- MACD 慢线 DEA = EMA(DIF,{ind.MACD_SIGNAL})\n"
+        f"macd_bar DECIMAL(18,4),  -- MACD 柱 = 2 × (DIF - DEA)\n"
+        f"kdj_k DECIMAL(18,2),  -- KDJ 的 K = SMA(RSV,{ind.KDJ_M1},1)\n"
+        f"kdj_d DECIMAL(18,2),  -- KDJ 的 D = SMA(K,{ind.KDJ_M2},1)\n"
+        f"kdj_j DECIMAL(18,2),  -- KDJ 的 J = 3K - 2D\n"
+        f"rsi DECIMAL(18,2),  -- RSI（Wilder 平滑，周期 {_RSI_N}）\n"
         f"score INTEGER,  -- 综合打分 0-100（缩量 30% + 地量持平 20% + 十字星 30% + 连续天数 20%）\n"
         f"PRIMARY KEY (trade_date, code)\n"
         f")"
     )
     sql_engine.execute(ddl)
+    # 旧表是 REAL，CREATE TABLE IF NOT EXISTS 不会改列类型，这里幂等迁移
+    db_schema.ensure_decimal_columns(sql_engine, driver, TABLE_NAME, DECIMAL_COLUMNS)
 
     delete_today: str = f"DELETE FROM {TABLE_NAME} WHERE trade_date = {ph}"
     insert: str = (

@@ -414,7 +414,13 @@ top = hits[:TOP_N]                                   # TOP_N = 100
 - 占位符按驱动选择：`sqlite` / `duckdb` → `?`，其它（mysql / postgresql）→ `%s`。
 - 建表语句中列说明直接写成 `--` **行内 SQL 注释**（sqlite 会存进 `sqlite_master.sql`，`.schema` 可见）；
   注意逗号必须写在注释之前，否则会被注释掉。
-- 表结构变动**不做自动迁移**：新增字段用 `ALTER TABLE ... ADD COLUMN`，改名用 `RENAME COLUMN`。
+- **数值列是定点小数**（`DECIMAL(18,2)` / `DECIMAL(18,4)`，见 `script/market/db_schema.py`）：
+  价格与成交量 2 位、比率与价格量级指标 4 位。浮点（原 `REAL`）既存前复权价的真精度，
+  也存二进制尾巴（`11.540000000000001`），改定点后写入即按定义小数位四舍五入。
+  `CREATE TABLE IF NOT EXISTS` 不会改已有表，所以 `_save_results` 建表后调
+  `ensure_decimal_columns()` 按 `information_schema` 比对，只对不一致的列 ALTER 一次（幂等）；
+  sqlite 无 `ALTER COLUMN TYPE` 且类型动态，跳过。
+- 其它表结构变动**不做自动迁移**：新增字段用 `ALTER TABLE ... ADD COLUMN`，改名用 `RENAME COLUMN`。
 - ⚠️ **2026-09 有过一次改名**（改成 T 日口径后的语义对齐），旧表需手动执行（SQLite ≥ 3.35 / MySQL 8 均支持）：
 
   ```sql
@@ -432,19 +438,19 @@ top = hits[:TOP_N]                                   # TOP_N = 100
 | `trade_date` | VARCHAR(8) | 交易日 T（`YYYYMMDD`），主键之一 |
 | `code` | VARCHAR(16) | 标的代码，如 `000001.SZ`，主键之一 |
 | `name` | VARCHAR(64) | 标的名称（已排除 ST/*ST） |
-| `close_price` | REAL | T 日收盘价（前复权） |
-| `prior_peak_price` | REAL | 下跌前高点：近 10 日（不含 T）有效最高价（**仅记录**，算不出为 NULL） |
-| `drop_from_peak_ratio` | REAL | 相对前高回落比例（**仅记录**，不参与筛选/打分/排序） |
-| `vol_avg_star` | REAL | 近 STAR_DAYS 日有效交易日均量（**仅记录**，不参与筛选/打分） |
-| `vol_today` | REAL | **T 日成交量**（地量；缩量闸门、地量倍数闸门、地量持平打分都用它） |
-| `vol_avg_before` | REAL | 之前 60 日（紧邻 T）平均成交量（剔除停牌） |
-| `vol_min_before` | REAL | 之前 60 日（紧邻 T）最小成交量（剔除停牌；地量倍数闸门 + 地量持平度打分都用它） |
-| `vol_shrink_ratio` | REAL | 缩量程度 = T 日量 / 前 60 日均量（条件 B 要求 ≤ 0.40 且 ≤ 前 60 日最低量 × 1.2） |
+| `close_price` | DECIMAL(18,2) | T 日收盘价（前复权） |
+| `prior_peak_price` | DECIMAL(18,2) | 下跌前高点：近 10 日（不含 T）有效最高价（**仅记录**，算不出为 NULL） |
+| `drop_from_peak_ratio` | DECIMAL(18,4) | 相对前高回落比例（**仅记录**，不参与筛选/打分/排序） |
+| `vol_avg_star` | DECIMAL(18,2) | 近 STAR_DAYS 日有效交易日均量（**仅记录**，不参与筛选/打分） |
+| `vol_today` | DECIMAL(18,2) | **T 日成交量**（地量；缩量闸门、地量倍数闸门、地量持平打分都用它） |
+| `vol_avg_before` | DECIMAL(18,2) | 之前 60 日（紧邻 T）平均成交量（剔除停牌） |
+| `vol_min_before` | DECIMAL(18,2) | 之前 60 日（紧邻 T）最小成交量（剔除停牌；地量倍数闸门 + 地量持平度打分都用它） |
+| `vol_shrink_ratio` | DECIMAL(18,4) | 缩量程度 = T 日量 / 前 60 日均量（条件 B 要求 ≤ 0.40 且 ≤ 前 60 日最低量 × 1.2） |
 | `doji_days` | INTEGER | 十字星天数 = 近 4 日内十字星数 + 向前连续延续数（可为 0） |
-| `doji_body_ratio` | REAL | 近 4 日中十字星日的实体/振幅均值（越小越规整；**无十字星时为 NULL**） |
-| `macd_dif` / `macd_dea` / `macd_bar` | REAL | T 日 MACD 三值 |
-| `kdj_k` / `kdj_d` / `kdj_j` | REAL | T 日 KDJ 三值 |
-| `rsi` | REAL | T 日 RSI（周期随 `_INDICATOR_SPECS["rsi"]`，默认 14） |
+| `doji_body_ratio` | DECIMAL(18,4) | 近 4 日中十字星日的实体/振幅均值（越小越规整；**无十字星时为 NULL**） |
+| `macd_dif` / `macd_dea` / `macd_bar` | DECIMAL(18,4) | T 日 MACD 三值 |
+| `kdj_k` / `kdj_d` / `kdj_j` | DECIMAL(18,2) | T 日 KDJ 三值 |
+| `rsi` | DECIMAL(18,2) | T 日 RSI（周期随 `_INDICATOR_SPECS["rsi"]`，默认 14） |
 | `score` | INTEGER | 综合打分 0–100 |
 
 ---
